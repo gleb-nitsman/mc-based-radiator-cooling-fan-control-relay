@@ -1,0 +1,2030 @@
+
+AVRASM ver. 2.1.2  C:\proj_src\cooler3.1\cooler3.asm Fri May 08 16:28:08 2009
+
+C:\proj_src\cooler3.1\cooler3.asm(1): Including file 'C:\proj_src\cooler3.1\cooler3.h'
+C:\proj_src\cooler3.1\cooler3.h(110): Including file 'C:\Program Files\Atmel\AVR Tools\AvrAssembler2\Appnotes\tn15def.inc'
+C:\proj_src\cooler3.1\cooler3.h(186): warning: Register r26 already defined by the .DEF directive
+C:\proj_src\cooler3.1\cooler3.asm(1): 'C:\proj_src\cooler3.1\cooler3.h' included form here
+C:\proj_src\cooler3.1\cooler3.h(187): warning: Register r27 already defined by the .DEF directive
+C:\proj_src\cooler3.1\cooler3.asm(1): 'C:\proj_src\cooler3.1\cooler3.h' included form here
+C:\proj_src\cooler3.1\cooler3.h(191): warning: Register r28 already defined by the .DEF directive
+C:\proj_src\cooler3.1\cooler3.asm(1): 'C:\proj_src\cooler3.1\cooler3.h' included form here
+C:\proj_src\cooler3.1\cooler3.h(195): warning: Register r29 already defined by the .DEF directive
+C:\proj_src\cooler3.1\cooler3.asm(1): 'C:\proj_src\cooler3.1\cooler3.h' included form here
+C:\proj_src\cooler3.1\cooler3.asm(2): Including file 'C:\proj_src\cooler3.1\cooler_macro.h'
+C:\proj_src\cooler3.1\cooler3.asm(238): Including file 'C:\proj_src\cooler3.1\cooler_lib.asm'
+C:\proj_src\cooler3.1\cooler_lib.asm(522): Including file 'C:\proj_src\cooler3.1\math.asm'
+C:\proj_src\cooler3.1\cooler_lib.asm(523): Including file 'C:\proj_src\cooler3.1\eeprom.asm'
+                 
+                 
+                 
+                 // DEVICE PINOUT CONFIG
+                 
+                 // PB0 (Aref) 	- Vref for ADC
+                 // PB1 (OC1A) 	- pulse out
+                 // PB2 			- ^FAN_ON
+                 // PB3 			- ^BUTTON / DIAG_OUT (LED)
+                 // PB4 (ADC3) 	- analog IN (temp sensor)
+                 
+                 
+                 // !!!!!!!!!!!!!!!!!!
+                 // if power MOSFET can be driven directly by PWM output (logic level MOSFET),
+                 // set the following define variable to 0
+                 // otherwise, if bipolar inverting cascade is used, set to 1
+                 //
+                 #define INVERTED_PWM (1)
+                 //
+                 // !!!!!!!!!!!!!!!!!!
+                 
+                 
+                 // set to 1 to write in EEPROM CPU ignition ON counts occurred since last test mode
+                 #define TRACK_RUN_COUNT (0)
+                 //
+                 
+                 
+                 // set to 1 to write in EEPROM CPU resets occurred due to watchdog timer
+                 #define TRACK_WDR_COUNT (0)
+                 //
+                 
+                 // set to 1 to perform ADC in every MAIN_SYNC cycle (every 640 msecs)
+                 // when set to 0 - ADC is performed every 2nd MAIN_SYNC (every 1.28 secs)
+                 #define ADC_EVERY_CYCLE (1)
+                 //
+                 
+                 // fan duty cycle calculation:
+                 // OCR1B = 255
+                 // OCR1A value: 
+                 // U < Umin : 240
+                 // Umin <= U <= Umax : 38 + (Umax - U) / (Umax - Umin) * (256 - 38)
+                 // Umax < U : 0
+                 // max OCR1A = 240 that gives 15 Timer1 counts min for ADC conversion
+                 // Timer1 count period = 0.625 uS * 32 = 20 uS/count -> 300 uS / ADC conversion min.
+                 
+                 .equ	OCR_MIN_VALUE	=	31		// min fan duty cycle = 31/256 (12%)
+                 .equ	OCR_MAX_VALUE	=	255		// max fan duty cycle = 255/256 (93% when turned on by temp sensor)
+                 .equ	OCR_ADC_VALUE	=	200		// provides gap for temp sensor voltage ADC while MOSFET is off (16 uSec * 36 = 576 uSeconds)
+                 .equ	OCR_START_VALUE	=	76		// start fan duty cycle = 76/256 (30%) 
+                 .equ	OCR_ENGINE_OFF_VALUE	=	128	// fan speed during engine shutoff = 128/256 (50%) 
+                 .equ	MIN_FAN_STATE_TIME		=	23	// 15 sec / 0.64 = 23 * 640ms synchronized fan_control calls
+                 .equ	MAX_FAN_DYN_DUTY		=	2	// 
+                 .equ	POWER_ON_CONTROL_DELAY	=	23	// 15 sec / 0.64 = 23 * 640ms synchronized fan_control calls
+                 .equ	ENGINE_SHUTDOWN_TIME	=	13	// 8 sec
+                 
+                 // ======= auto config settings ===============
+                 //
+                 .equ	AUTO_CONFIG_CORR_TIME		= 	4	// 4 * 0.64 = 3 sec
+                 
+                 // fan slows down from 75 to 12% duty for 164 * 0.64 seconds = 103 secs
+                 .equ	AUTO_CONFIG_OCR_VALUE_1		=	192
+                 .equ	AUTO_CONFIG_OCR_VALUE_2		=	31
+                 
+                 // then fan is paused for 60 seconds
+                 .equ	AUTO_CONFIG_GAP_TIME		= 	94	// 60 sec / 0.64  = 94 
+                 //
+                 
+                 // auto config algo:
+                 ;
+                 // 1. is activated when config not set and ECU "fan on" request becomes active
+                 // 2. remember ADC reading at "fan on" request as T1
+                 // 3. wait until "fan on" becomes inactive again
+                 // 4. turn on fan at AUTO_CONFIG_OCR_VALUE_1 speed for AUTO_CONFIG_FAN_ON_TIME_1 seconds
+                 // 5. slow down fan to AUTO_CONFIG_OCR_VALUE_2 speed and keep it running for AUTO_CONFIG_FAN_ON_TIME_2 seconds
+                 // 6. turn off fan
+                 // 7. wait AUTO_CONFIG_GAP_TIME seconds
+                 // 8. make sure that no "fan on" requests come from ECU during steps 4-7
+                 // 9. if step 8 is FALSE - exit from the auto config procedure
+                 // 10. check for button pressed during step 7 - if pressed, go to step 11
+                 // 11. remember ADC reading as T2
+                 // 12. set start threshold as T2 and end threshold as T1
+                 
+                 // ============================================
+                 .equ	STEP_SAVING_CORRECTION	=	5
+                 .equ	STEP_WAITING_FAN_OFF 	=	4
+                 .equ	STEP_SLOWING_FAN		=	3
+                 .equ	STEP_WAITING_GAP		=	2
+                 .equ	STEP_SAVING_CONFIG		= 	1
+                 
+                 
+                 
+                 // approx Uts (U temp sensor) @ 14V (running engine)
+                 //
+                 //	t, C		U, V
+                 //
+                 //	45			9.0
+                 //	60			7.4
+                 //	65			6.5
+                 //	70			6.15
+                 //	75			5.7
+                 //	80			5.2
+                 //	85			4.65
+                 
+                 // Uts @ 13V (stall engine) @ 85 C = 4.02
+                 
+                 .equ	CONFIG_MIN_MAX_GAP		=	4			// min difference between T1 and T2 ADC readings
+                 .equ	DISCONNECTED_MAX_ADC	=	16			// max ADC when temp sensor is disconnected
+                 .equ	AUTO_CONFIG_MAX_ADC		=	248			// max ADC reading for T1
+                 .equ	AUTO_CONFIG_MIN_ADC		=	24			// max ADC reading for T2
+                 .equ	ADC_MAX_NEG_DYNAMICS	=	2			// max negative difference
+                 
+                 		.include	"tn15def.inc"
+                 
+                 ;***** Created: 2005-11-04 09:37 ******* Source: ATtiny15.xml ************
+                 ;*************************************************************************
+                 ;* A P P L I C A T I O N   N O T E   F O R   T H E   A V R   F A M I L Y
+                 ;* 
+                 ;* Number            : AVR000
+                 ;* File Name         : "tn15def.inc"
+                 ;* Title             : Register/Bit Definitions for the ATtiny15
+                 ;* Date              : 2005-11-04
+                 ;* Version           : 2.21
+                 ;* Support E-mail    : avr@atmel.com
+                 ;* Target MCU        : ATtiny15
+                 ;* 
+                 ;* DESCRIPTION
+                 ;* When including this file in the assembly program file, all I/O register 
+                 ;* names and I/O register bit names appearing in the data book can be used.
+                 ;* In addition, the six registers forming the three data pointers X, Y and 
+                 ;* Z have been assigned names XL - ZH. Highest RAM address for Internal 
+                 ;* SRAM is also defined 
+                 ;* 
+                 ;* The Register names are represented by their hexadecimal address.
+                 ;* 
+                 ;* The Register Bit names are represented by their bit number (0-7).
+                 ;* 
+                 ;* Please observe the difference in using the bit names with instructions
+                 ;* such as "sbr"/"cbr" (set/clear bit in register) and "sbrs"/"sbrc"
+                 ;* (skip if bit in register set/cleared). The following example illustrates
+                 ;* this:
+                 ;* 
+                 ;* in    r16,PORTB             ;read PORTB latch
+                 ;* sbr   r16,(1<<PB6)+(1<<PB5) ;set PB6 and PB5 (use masks, not bit#)
+                 ;* out   PORTB,r16             ;output to PORTB
+                 ;* 
+                 ;* in    r16,TIFR              ;read the Timer Interrupt Flag Register
+                 ;* sbrc  r16,TOV0              ;test the overflow flag (use bit#)
+                 ;* rjmp  TOV0_is_set           ;jump if set
+                 ;* ...                         ;otherwise do something else
+                 ;*************************************************************************
+                 
+                 #ifndef _TN15DEF_INC_
+                 #define _TN15DEF_INC_
+                 
+                 
+                 #pragma partinc 0
+                 
+                 ; ***** SPECIFY DEVICE ***************************************************
+                 .device ATtiny15
+                 #pragma AVRPART ADMIN PART_NAME ATtiny15
+                 .equ	SIGNATURE_000	= 0x1e
+                 .equ	SIGNATURE_001	= 0x90
+                 .equ	SIGNATURE_002	= 0x06
+                 
+                 #pragma AVRPART CORE CORE_VERSION V0E
+                 
+                 
+                 ; ***** I/O REGISTER DEFINITIONS *****************************************
+                 ; NOTE:
+                 ; Definitions marked "MEMORY MAPPED"are extended I/O ports
+                 ; and cannot be used with IN/OUT instructions
+                 .equ	SREG	= 0x3f
+                 .equ	GIMSK	= 0x3b
+                 .equ	GIFR	= 0x3a
+                 .equ	TIMSK	= 0x39
+                 .equ	TIFR	= 0x38
+                 .equ	MCUCR	= 0x35
+                 .equ	MCUSR	= 0x34
+                 .equ	TCCR0	= 0x33
+                 .equ	TCNT0	= 0x32
+                 .equ	OSCCAL	= 0x31
+                 .equ	TCCR1	= 0x30
+                 .equ	TCNT1	= 0x2f
+                 .equ	OCR1A	= 0x2e
+                 .equ	OCR1B	= 0x2d
+                 .equ	SFIOR	= 0x2c
+                 .equ	WDTCR	= 0x21
+                 .equ	EEAR	= 0x1e
+                 .equ	EEDR	= 0x1d
+                 .equ	EECR	= 0x1c
+                 .equ	PORTB	= 0x18
+                 .equ	DDRB	= 0x17
+                 .equ	PINB	= 0x16
+                 .equ	ACSR	= 0x08
+                 .equ	ADMUX	= 0x07
+                 .equ	ADCSR	= 0x06
+                 .equ	ADCH	= 0x05
+                 .equ	ADCL	= 0x04
+                 
+                 
+                 ; ***** BIT DEFINITIONS **************************************************
+                 
+                 ; ***** AD_CONVERTER *****************
+                 ; ADMUX - The ADC multiplexer Selection Register
+                 .equ	MUX0	= 0	; Analog Channel and Gain Selection Bits
+                 .equ	MUX1	= 1	; Analog Channel and Gain Selection Bits
+                 .equ	MUX2	= 2	; Analog Channel and Gain Selection Bits
+                 .equ	ADLAR	= 5	; Left Adjust Result
+                 .equ	REFS0	= 6	; Reference Selection Bit 0
+                 .equ	REFS1	= 7	; Reference Selection Bit 1
+                 
+                 ; ADCSR - The ADC Control and Status register
+                 .equ	ADPS0	= 0	; ADC  Prescaler Select Bits
+                 .equ	ADPS1	= 1	; ADC  Prescaler Select Bits
+                 .equ	ADPS2	= 2	; ADC  Prescaler Select Bits
+                 .equ	ADIE	= 3	; ADC Interrupt Enable
+                 .equ	ADIF	= 4	; ADC Interrupt Flag
+                 .equ	ADFR	= 5	; ADC  Free Running Select
+                 .equ	ADSC	= 6	; ADC Start Conversion
+                 .equ	ADEN	= 7	; ADC Enable
+                 
+                 ; ADCH - ADC Data Register High Byte
+                 .equ	ADCH0	= 0	; ADC Data Register High Byte Bit 0
+                 .equ	ADCH1	= 1	; ADC Data Register High Byte Bit 1
+                 .equ	ADCH2	= 2	; ADC Data Register High Byte Bit 2
+                 .equ	ADCH3	= 3	; ADC Data Register High Byte Bit 3
+                 .equ	ADCH4	= 4	; ADC Data Register High Byte Bit 4
+                 .equ	ADCH5	= 5	; ADC Data Register High Byte Bit 5
+                 .equ	ADCH6	= 6	; ADC Data Register High Byte Bit 6
+                 .equ	ADCH7	= 7	; ADC Data Register High Byte Bit 7
+                 
+                 ; ADCL - ADC Data Register Low Byte
+                 .equ	ADCL0	= 0	; ADC Data Register Low Byte Bit 0
+                 .equ	ADCL1	= 1	; ADC Data Register Low Byte Bit 1
+                 .equ	ADCL2	= 2	; ADC Data Register Low Byte Bit 2
+                 .equ	ADCL3	= 3	; ADC Data Register Low Byte Bit 3
+                 .equ	ADCL4	= 4	; ADC Data Register Low Byte Bit 4
+                 .equ	ADCL5	= 5	; ADC Data Register Low Byte Bit 5
+                 .equ	ADCL6	= 6	; ADC Data Register Low Byte Bit 6
+                 .equ	ADCL7	= 7	; ADC Data Register Low Byte Bit 7
+                 
+                 
+                 ; ***** ANALOG_COMPARATOR ************
+                 ; ACSR - Analog Comparator Control And Status Register
+                 .equ	ACIS0	= 0	; Analog Comparator Interrupt Mode Select bit 0
+                 .equ	ACIS1	= 1	; Analog Comparator Interrupt Mode Select bit 1
+                 .equ	ACIE	= 3	; Analog Comparator Interrupt Enable
+                 .equ	ACI	= 4	; Analog Comparator Interrupt Flag
+                 .equ	ACO	= 5	; Analog Compare Output
+                 .equ	ACBG	= 6	; Analog Comparator Bandgap Select
+                 .equ	AINBG6	= ACBG	; For compatibility
+                 .equ	ACD	= 7	; Analog Comparator Disable
+                 
+                 
+                 ; ***** EEPROM ***********************
+                 ; EEAR - EEPROM Read/Write Access
+                 .equ	EEAR0	= 0	; EEPROM Read/Write Access bit 0
+                 .equ	EEAR1	= 1	; EEPROM Read/Write Access bit 1
+                 .equ	EEAR2	= 2	; EEPROM Read/Write Access bit 2
+                 .equ	EEAR3	= 3	; EEPROM Read/Write Access bit 3
+                 .equ	EEAR4	= 4	; EEPROM Read/Write Access bit 4
+                 .equ	EEAR5	= 5	; EEPROM Read/Write Access bit 5
+                 
+                 ; EEDR - EEPROM Data Register
+                 .equ	EEDR0	= 0	; EEPROM Data Register bit 0
+                 .equ	EEDR1	= 1	; EEPROM Data Register bit 1
+                 .equ	EEDR2	= 2	; EEPROM Data Register bit 2
+                 .equ	EEDR3	= 3	; EEPROM Data Register bit 3
+                 .equ	EEDR4	= 4	; EEPROM Data Register bit 4
+                 .equ	EEDR5	= 5	; EEPROM Data Register bit 5
+                 .equ	EEDR6	= 6	; EEPROM Data Register bit 6
+                 .equ	EEDR7	= 7	; EEPROM Data Register bit 7
+                 
+                 ; EECR - EEPROM Control Register
+                 .equ	EERE	= 0	; EEPROM Read Enable
+                 .equ	EEWE	= 1	; EEPROM Write Enable
+                 .equ	EEMWE	= 2	; EEPROM Master Write Enable
+                 .equ	EERIE	= 3	; EEProm Ready Interrupt Enable
+                 
+                 
+                 ; ***** PORTB ************************
+                 ; PORTB - Data Register, Port B
+                 .equ	PORTB0	= 0	; 
+                 .equ	PB0	= 0	; For compatibility
+                 .equ	PORTB1	= 1	; 
+                 .equ	PB1	= 1	; For compatibility
+                 .equ	PORTB2	= 2	; 
+                 .equ	PB2	= 2	; For compatibility
+                 .equ	PORTB3	= 3	; 
+                 .equ	PB3	= 3	; For compatibility
+                 .equ	PORTB4	= 4	; 
+                 .equ	PB4	= 4	; For compatibility
+                 
+                 ; DDRB - Data Direction Register, Port B
+                 .equ	DDB0	= 0	; 
+                 .equ	DDB1	= 1	; 
+                 .equ	DDB2	= 2	; 
+                 .equ	DDB3	= 3	; 
+                 .equ	DDB4	= 4	; 
+                 .equ	DDB5	= 5	; 
+                 
+                 ; PINB - Input Pins, Port B
+                 .equ	PINB0	= 0	; 
+                 .equ	PINB1	= 1	; 
+                 .equ	PINB2	= 2	; 
+                 .equ	PINB3	= 3	; 
+                 .equ	PINB4	= 4	; 
+                 .equ	PINB5	= 5	; 
+                 
+                 
+                 ; ***** TIMER_COUNTER_0 **************
+                 ; TIMSK - Timer/Counter Interrupt Mask Register
+                 .equ	TOIE0	= 1	; Timer/Counter0 Overflow Interrupt Enable
+                 
+                 ; TIFR - Timer/Counter Interrupt Flag register
+                 .equ	TOV0	= 1	; Timer/Counter0 Overflow Flag
+                 
+                 ; TCCR0 - Timer/Counter0 Control Register
+                 .equ	CS00	= 0	; Clock Select0 bit 0
+                 .equ	CS01	= 1	; Clock Select0 bit 1
+                 .equ	CS02	= 2	; Clock Select0 bit 2
+                 
+                 ; TCNT0 - Timer Counter 0
+                 .equ	TCNT00	= 0	; Timer Counter 0 bit 0
+                 .equ	TCNT01	= 1	; Timer Counter 0 bit 1
+                 .equ	TCNT02	= 2	; Timer Counter 0 bit 2
+                 .equ	TCNT03	= 3	; Timer Counter 0 bit 3
+                 .equ	TCNT04	= 4	; Timer Counter 0 bit 4
+                 .equ	TCNT05	= 5	; Timer Counter 0 bit 5
+                 .equ	TCNT06	= 6	; Timer Counter 0 bit 6
+                 .equ	TCNT07	= 7	; Timer Counter 0 bit 7
+                 
+                 
+                 ; ***** WATCHDOG *********************
+                 ; WDTCR - Watchdog Timer Control Register
+                 .equ	WDP0	= 0	; Watch Dog Timer Prescaler bit 0
+                 .equ	WDP1	= 1	; Watch Dog Timer Prescaler bit 1
+                 .equ	WDP2	= 2	; Watch Dog Timer Prescaler bit 2
+                 .equ	WDE	= 3	; Watch Dog Enable
+                 .equ	WDTOE	= 4	; RW
+                 .equ	WDDE	= WDTOE	; For compatibility
+                 
+                 
+                 ; ***** CPU **************************
+                 ; SREG - Status Register
+                 .equ	SREG_C	= 0	; Carry Flag
+                 .equ	SREG_Z	= 1	; Zero Flag
+                 .equ	SREG_N	= 2	; Negative Flag
+                 .equ	SREG_V	= 3	; Two's Complement Overflow Flag
+                 .equ	SREG_S	= 4	; Sign Bit
+                 .equ	SREG_H	= 5	; Half Carry Flag
+                 .equ	SREG_T	= 6	; Bit Copy Storage
+                 .equ	SREG_I	= 7	; Global Interrupt Enable
+                 
+                 ; MCUCR - MCU Control Register
+                 .equ	ISC00	= 0	; Interrupt Sense Control 0 bit 0
+                 .equ	ISC01	= 1	; Interrupt Sense Control 0 bit 1
+                 .equ	SM0	= 3	; Sleep Mode Select Bit 0
+                 .equ	SM1	= 4	; Sleep Mode Select Bit 1
+                 .equ	SE	= 5	; Sleep Enable
+                 .equ	PUD	= 6	; Pull-up Disable
+                 
+                 ; MCUSR - MCU Status register
+                 .equ	PORF	= 0	; Power-On Reset Flag
+                 .equ	EXTRF	= 1	; External Reset Flag
+                 .equ	BORF	= 2	; Brown-out Reset Flag
+                 .equ	WDRF	= 3	; Watchdog Reset Flag
+                 
+                 ; OSCCAL - Status Register
+                 .equ	CAL0	= 0	; Oscillator Calibration Value Bit 0
+                 .equ	CAL1	= 1	; Oscillator Calibration Value Bit 1
+                 .equ	CAL2	= 2	; Oscillator Calibration Value Bit 2
+                 .equ	CAL3	= 3	; Oscillator Calibration Value Bit 3
+                 .equ	CAL4	= 4
+                 .equ	CAL5	= 5	; Oscillator Calibration Value Bit 5
+                 .equ	CAL6	= 6	; Oscillator Calibration Value Bit 6
+                 .equ	CAL7	= 7	; Oscillator Calibration Value Bit 7
+                 
+                 
+                 ; ***** EXTERNAL_INTERRUPT ***********
+                 ; GIMSK - General Interrupt Mask Register
+                 .equ	PCIE	= 5	; Pin Change Interrupt Enable
+                 .equ	INT0	= 6	; External Interrupt Request 0 Enable
+                 
+                 ; GIFR - General Interrupt Flag register
+                 .equ	PCIF	= 5	; Pin Change Interrupt Flag
+                 .equ	INTF0	= 6	; External Interrupt Flag 0
+                 
+                 
+                 ; ***** TIMER_COUNTER_1 **************
+                 ; TCCR1 - Timer/Counter Control Register
+                 .equ	CS10	= 0	; Clock Select Bits
+                 .equ	CS11	= 1	; Clock Select Bits
+                 .equ	CS12	= 2	; Clock Select Bits
+                 .equ	CS13	= 3	; Clock Select Bits
+                 .equ	COM1A0	= 4	; Compare Output Mode, Bit 1
+                 .equ	COM1A1	= 5	; Compare Output Mode, Bit 0
+                 .equ	PWM1	= 6	; Pulse Width Modulator Enable
+                 .equ	CTC1	= 7	; Clear Timer/Counter on Compare Match
+                 
+                 ; TCNT1 - Timer/Counter Register
+                 .equ	TCNT1_0	= 0	; Timer/Counter Register Bit 0
+                 .equ	TCNT1_1	= 1	; Timer/Counter Register Bit 1
+                 .equ	TCNT1_2	= 2	; Timer/Counter Register Bit 2
+                 .equ	TCNT1_3	= 3	; Timer/Counter Register Bit 3
+                 .equ	TCNT1_4	= 4	; Timer/Counter Register Bit 4
+                 .equ	TCNT1_5	= 5	; Timer/Counter Register Bit 5
+                 .equ	TCNT1_6	= 6	; Timer/Counter Register Bit 6
+                 .equ	TCNT1_7	= 7	; Timer/Counter Register Bit 7
+                 
+                 ; OCR1A - Output Compare Register
+                 .equ	OCR1A0	= 0	; Output Compare Register A Bit 0
+                 .equ	OCR1A1	= 1	; Output Compare Register A Bit 1
+                 .equ	OCR1A2	= 2	; Output Compare Register A Bit 2
+                 .equ	OCR1A3	= 3	; Output Compare Register A Bit 3
+                 .equ	OCR1A4	= 4	; Output Compare Register A Bit 4
+                 .equ	OCR1A5	= 5	; Output Compare Register A Bit 5
+                 .equ	OCR1A6	= 6	; Output Compare Register A Bit 6
+                 .equ	OCR1A7	= 7	; Output Compare Register A Bit 7
+                 
+                 ; OCR1B - Output Compare Register
+                 .equ	OCR1B0	= 0	; Output Compare Register B Bit 0
+                 .equ	OCR1B1	= 1	; Output Compare Register B Bit 1
+                 .equ	OCR1B2	= 2	; Output Compare Register B Bit 2
+                 .equ	OCR1B3	= 3	; Output Compare Register B Bit 3
+                 .equ	OCR1B4	= 4	; Output Compare Register B Bit 4
+                 .equ	OCR1B5	= 5	; Output Compare Register B Bit 5
+                 .equ	OCR1B6	= 6	; Output Compare Register B Bit 6
+                 .equ	OCR1B7	= 7	; Output Compare Register B Bit 7
+                 
+                 ; TIMSK - Timer/Counter Interrupt Mask Register
+                 .equ	TOIE1	= 2	; Timer/Counter1 Overflow Interrupt Enable
+                 .equ	OCIE1A	= 6	; OCIE1A: Timer/Counter1 Output Compare Interrupt Enable
+                 
+                 ; TIFR - Timer/Counter Interrupt Flag Register
+                 .equ	TOV1	= 2	; Timer/Counter1 Overflow Flag
+                 .equ	OCF1A	= 6	; Timer/Counter1 Output Compare Flag 1A
+                 
+                 ; SFIOR - Special Function IO Register
+                 .equ	PSR0	= 0	; Prescaler Reset Timer/Counter0
+                 .equ	PSR1	= 1	; Prescaler Reset Timer/Counter1
+                 .equ	FOC1A	= 2	; Force Output Compare 1A
+                 
+                 
+                 
+                 ; ***** LOCKSBITS ********************************************************
+                 .equ	LB1	= 0	; Lockbit
+                 .equ	LB2	= 1	; Lockbit
+                 
+                 
+                 ; ***** FUSES ************************************************************
+                 ; LOW fuse bits
+                 
+                 
+                 
+                 ; ***** CPU REGISTER DEFINITIONS *****************************************
+                 .def	XH	= r27
+                 .def	XL	= r26
+                 .def	YH	= r29
+                 .def	YL	= r28
+                 .def	ZH	= r31
+                 .def	ZL	= r30
+                 
+                 
+                 
+                 ; ***** DATA MEMORY DECLARATIONS *****************************************
+                 .equ	FLASHEND	= 0x01ff	; Note: Word address
+                 .equ	IOEND	= 0x003f
+                 .equ	SRAM_SIZE	= 0
+                 .equ	RAMEND	= 0x0000
+                 .equ	XRAMEND	= 0x0000
+                 .equ	E2END	= 0x003f
+                 .equ	EEPROMEND	= 0x003f
+                 .equ	EEADRBITS	= 6
+                 #pragma AVRPART MEMORY PROG_FLASH 1024
+                 #pragma AVRPART MEMORY EEPROM 64
+                 #pragma AVRPART MEMORY INT_SRAM SIZE 0
+                 #pragma AVRPART MEMORY INT_SRAM START_ADDR 0x0
+                 
+                 
+                 
+                 
+                 
+                 ; ***** INTERRUPT VECTORS ************************************************
+                 .equ	INT0addr	= 0x0001	; External Interrupt 0
+                 .equ	PCI0addr	= 0x0002	; External Interrupt Request 0
+                 .equ	OC1addr	= 0x0003	; Timer/Counter1 Compare Match
+                 .equ	OVF1addr	= 0x0004	; Timer/Counter1 Overflow
+                 .equ	OVF0addr	= 0x0005	; Timer/Counter0 Overflow
+                 .equ	ERDYaddr	= 0x0006	; EEPROM Ready
+                 .equ	ACIaddr	= 0x0007	; Analog Comparator
+                 .equ	ADCCaddr	= 0x0008	; ADC Conversion Ready
+                 
+                 .equ	INT_VECTORS_SIZE	= 9	; size in words
+                 
+                 #pragma AVRPART CORE INSTRUCTIONS_NOT_SUPPORTED break
+                 
+                 #endif  /* _TN15DEF_INC_ */
+                 
+                 ; ***** END OF FILE ******************************************************
+                 
+                 
+                 .equ	OSCCAL_CAL		= 	133;117;138
+                 
+                 //
+                 // ------------- Register variables assignment -----------------
+                 //
+                 // R0..R7 - ADC average calc buffer
+                 .equ	ADC_BUFFER		=	0
+                 .equ	ADC_BUFFER_LEN	=	8
+                 
+                 
+                 // -------------  R8 - Flags ----------------------------------
+                 .def	FLAGS			=	r8
+                 		.equ	ENGINE_SHUTTING_DOWN	=	0
+                 		.equ	FAN_ON_FLAG				=	1
+                 		.equ	WDR_OCCUR_FLAG			= 	2
+                 		.equ	AUTO_CONFIG_FLAG		= 	3
+                 		.equ	CONFIG_ERROR_FLAG		= 	4
+                 		.equ	CONFIG_SET_FLAG			= 	5
+                 		.equ	ADC_DISCONNECTED_FLAG	=	6
+                 		.equ	ADC_CORRECTED_FLAG		=	7
+                 // ------------------------------------------------------------
+                 
+                 // -------------  R9 - Extended Flags -------------------------
+                 .def	FLAGS_EX		=	r9
+                 		.equ	MAIN_SYNC_FLAG			=	0
+                 		.equ	ADC_FLAG		 		=	1
+                 		.equ	ADC_EVER_CONNECTED_FLAG	=	2
+                 		.equ	BUTTON_FLAG				= 	3
+                 		.equ	FAN_ON_CHANGED_FLAG		= 	4
+                 		.equ	FAN_PULSE_OCCUR_FLAG	= 	5
+                 		.equ	TEST_MODE_FLAG			=	6
+                 		.equ	CUR_ADC_IN_RANGE_FLAG	= 	7
+                 // ------------------------------------------------------------
+                 
+                 // -------------  R10 - SREG for ISRs -------------------------
+                 .def	SREG_COPY		= 	r10
+                 // ------------------------------------------------------------
+                 
+                 // ------------- R11, R12 - High/Low Temp thresholds ----------
+                 .def	MIN_ADC			=	r11
+                 .def	MAX_ADC			=	r12	
+                 // ------------------------------------------------------------
+                 
+                 // ------------- Power-on delay -----------
+                 .def	POWER_ON_DELAY		=	r13
+                 // ------------------------------------------------------------
+                 
+                 // ------------- Fan control -----------
+                 .def	FAN_CONTROL_REQ_OCR	=	r14
+                 // ------------------------------------------------------------
+                 
+                 .def	ENGINE_SHUTDOWN_COUNTER	=	r15
+                 
+                 // ------------- R16..R21 - Math variables --------------------
+                 .def	BYTE_ACC		= 	r16
+                 .def	MATH_COUNT		= 	r17
+                 .def	WORD_ACC_L		=	r18
+                 .def	WORD_ACC_H		=	r19
+                 .def	MATH_WORD_L		=	r20
+                 .def	MATH_WORD_H		=	r21
+                 // ------------------------------------------------------------
+                 
+                 // ------------- Mean ADC reading -----------------------------
+                 .def	CUR_ADC			=	r22
+                 // ------------------------------------------------------------
+                 
+                 // -------------	T0_OVERFLOW ISR variables --------------------
+                 .def	DIAG_OUT_BYTE	=	r23			// diagnostics byte latch
+                 .def	DIAG_COUNT		=	r24			// diagnostics counter
+                 .def	TEMP_T0			=	r25			// temp variable for the ISR
+                 // ------------------------------------------------------------
+                 
+                 // ------------- Autoconfig Timing ----------------------------
+                 .def	AUTO_CONFIG_TIMING	=	r26
+                 .def	AUTO_CONFIG_STEP 	=	r27
+                 // ------------------------------------------------------------
+                 
+                 // ------------- FAN control and test mode vars ---------------
+                 .def	FAN_CONTROL_TIMING	=	r28
+                 // ------------------------------------------------------------
+                 
+                 // ------------- ADC correction at full fan RPM ---------------
+                 .def	ADC_LOAD_CORRECTION	=	r29
+                 // ------------------------------------------------------------
+                 
+                 		.include	"cooler_macro.h"
+                 
+                 // ------- initialize vars and SFRs ---------------------------------
+                 .MACRO	_INITIALIZE
+                 		cli		
+                 
+                 		ldi		BYTE_ACC,	OSCCAL_CAL	// calibr constant for 1.6 MHz
+                 		out		OSCCAL, BYTE_ACC		// correct clock freq
+                 
+                 		ldi		BYTE_ACC,	(1 << PORTB3) | (1 << PORTB1)	// set PB.1,3 to high
+                 		out		PORTB,	BYTE_ACC		// setup portB pins
+                 
+                 		ldi		BYTE_ACC,	(1 << PORTB1)
+                 		out		DDRB,	BYTE_ACC		// set PORTB.1 to output
+                 
+                 
+                 		ldi		BYTE_ACC, 	(1 << ACD)
+                 		out		ACSR,	BYTE_ACC		// disable comparator
+                 
+                 		ldi		BYTE_ACC,	(1 << ADEN) | (1 << ADPS2)	// ADEN | ADPS2 enable ADC, ADC freq = clock/16
+                 		out		ADCSR,	BYTE_ACC		// configure ADC
+                 		
+                 		ldi		BYTE_ACC,	(1 << REFS0) | (1 << ADLAR) | (1 << MUX1) | (1 << MUX0)
+                 		out		ADMUX,	BYTE_ACC		// External Vref to PORTB.0, ADLAR | ADC3 input
+                 
+                 		ldi		BYTE_ACC,	(1 << CS02) | (1 << CS00)
+                 		out		TCCR0,	BYTE_ACC		// timer 0 clock/1024
+                 
+                 		ldi		BYTE_ACC,	(1 << TOIE0)// TOIE0 
+                 		out		TIMSK,	BYTE_ACC		// enable int's from Timer0 overflow (6 Hz)
+                 		
+                 		ser		CUR_ADC					// current ADC = 255 (further in the code also sets ADC Buffer to 0xFF)
+                 		out		OCR1B,	CUR_ADC			// OCR1B is also set to 0xFF
+                 		
+                 		clr		BYTE_ACC				// BYTE_ACC contains 0x00 - used further in the code
+                 		out		OCR1A,	BYTE_ACC		// set OCR1A to 0 to drive PWM out low
+                 
+                 #if INVERTED_PWM 
+                 		// PWM mode, inverted PWM on PORTB.1, prescaler = clock / 32 (62.5 kHz, 16 uSec)
+                 		ldi		MATH_COUNT,	(1 << PWM1) | (1 << COM1A1) | (1 << COM1A0) | (1 << CS13) | (1 << CS11)
+                 #else
+                 #endif
+                 		out		TCCR1,	MATH_COUNT		// setup Timer1
+                 
+                 		clr		FLAGS					// clear flags
+                 		clr		FLAGS_EX				// clear extended flags
+                 
+                 		// set ADC mean buffer to 255 - to avoid starting fan when empty buffer positions have 0
+                 		ldi		ZL,	ADC_BUFFER + ADC_BUFFER_LEN
+                 
+                 init_clr_buf:
+                 		dec		ZL
+                 		st		Z,		CUR_ADC		// CUR_ADC is already set to 0xFF by SER instruction above !
+                 		brne	init_clr_buf
+                 
+                 // buffer cleared, ZL set to 0
+                 		out		ADCH,	CUR_ADC		// pre-fill ADCH with 255 as previous ADC reading
+                 
+                 		set									// T flag is set to be used far below !!!
+                 
+                 		in		MATH_COUNT,	MCUSR			//
+                 		sbrc	MATH_COUNT,	WDRF			// WDRF	- check if Watchdog reset occurred
+                 			bld		FLAGS,	WDR_OCCUR_FLAG	// set WDR_OCCUR_FLAG if yes
+                 
+                 		clr		DIAG_COUNT				// clear diag timing
+                 		in		DIAG_OUT_BYTE,	ADCH	// set to 255 diag ADC latch
+                 		clr		ADC_LOAD_CORRECTION		// clear ADC correction
+                 	
+                 // check if button pressed upon power on
+                 // if so, clear config info and enter test mode
+                 		sbic	PINB,	PORTB3				// read button status
+                 			rjmp	init_skip_clr_config	// not pressed upon power-on, skip unconfiguring
+                 
+                 		//set										// make sure T flag is already set by SET instruction above !!!
+                 		bld		FLAGS_EX,	TEST_MODE_FLAG			// set test mode flag
+                 
+                 // clear config info
+                 		ldi		WORD_ACC_L,	EEPROM_CONFIG_CRC		// write 0 to CRC to make EEPROM_CONFIG invalid
+                 		rcall	eeprom_write						 
+                 
+                 #if TRACK_RUN_COUNT
+                 	#if EEPROM_WDR_COUNT
+                 	#endif
+                 #else
+                 	#if EEPROM_WDR_COUNT
+                 	#endif
+                 #endif
+                 		
+                 init_skip_clr_config:
+                 		ldi		BYTE_ACC,	(1 << PORTB3) | (1 << PORTB1)
+                 		out		DDRB,		BYTE_ACC				// set PORTB.1, 3 to output
+                 
+                 // read min/max thresholds from EEPROM
+                 		clr		WORD_ACC_H							// clear checksum accumulator
+                 		ldi		WORD_ACC_L,		EEPROM_ADC_CORRECTION	// read config marker
+                 		rcall	eeprom_read_checksum
+                 		mov		ADC_LOAD_CORRECTION,	BYTE_ACC
+                 
+                 		rcall	eeprom_read_preinc_checksum				// read EEPROM_U_MIN (++WORD_ACC_L)
+                 		mov		MIN_ADC,		BYTE_ACC
+                 		
+                 		rcall	eeprom_read_preinc_checksum				// read EEPROM_U_MAX (++WORD_ACC_L)
+                 		mov		MAX_ADC,		BYTE_ACC
+                 
+                 		rcall	eeprom_read_preinc_checksum				// read EEPROM_CONFIG_CRC (++WORD_ACC_L)
+                 		brne	init_config_incorrect					// checksum should be 0 - if not, config incorrect	
+                 	
+                 // config is ok, set flag
+                 
+                 		set											// make sure T flag is already set by SET instruction above !!!
+                 		bld		FLAGS,			CONFIG_SET_FLAG		// setting 'Config valid' flag
+                 
+                 init_config_incorrect:
+                 
+                 #if TRACK_RUN_COUNT
+                 #endif
+                 
+                 #if TRACK_WDR_COUNT
+                 #endif
+                 
+                 // ----- enable interrupts - entering main loop
+                 init_skip_wdr_inc:
+                 
+                 		ldi		BYTE_ACC,		POWER_ON_CONTROL_DELAY
+                 		mov		POWER_ON_DELAY,	BYTE_ACC
+                 
+                 		clr		AUTO_CONFIG_STEP
+                 		clr		FAN_CONTROL_TIMING				// TEST_MODE_COUNT in test mode
+                 		clr		FAN_CONTROL_REQ_OCR
+                 		clr		ENGINE_SHUTDOWN_COUNTER
+                 
+                 		ldi		BYTE_ACC,		(1 << WDE) | (1 << WDP2) | (1 << WDP1) | (1 << WDP0)
+                 		out		WDTCR,			BYTE_ACC		// enable WDT
+                 
+                 		sei
+                 
+                 .ENDMACRO
+                 // -----------------------------------------------------------------------------------------------------------------
+                 
+                 
+                 //
+                 // ------- save configuration procedure  ---------------------------------------------------------------------------
+                 .MACRO	_SAVE_CONFIG
+                 
+                 		ldi		WORD_ACC_L,		EEPROM_ADC_CORRECTION
+                 		mov		BYTE_ACC,		ADC_LOAD_CORRECTION
+                 		mov		WORD_ACC_H,		BYTE_ACC			// checksum - 1st byte
+                 		rcall	eeprom_write						// 
+                 		
+                 		mov		BYTE_ACC,		MIN_ADC				// write MIN_ADC to eeprom
+                 		rcall	eeprom_write_preinc_checksum		// EEPROM_U_MIN (++WORD_ACC_L), checksum (WORD_ACC_H) += BYTE_ACC
+                 
+                 		mov		BYTE_ACC,		MAX_ADC				// write MAX_ADC to eeprom
+                 		rcall	eeprom_write_preinc_checksum		// EEPROM_U_MAX (++WORD_ACC_L), checksum (WORD_ACC_H) += BYTE_ACC
+                 
+                 		neg		WORD_ACC_H							// make two's complement 
+                 		
+                 		mov		BYTE_ACC,		WORD_ACC_H
+                 		rcall	eeprom_write_preinc					// EEPROM_CONFIG_CRC (++WORD_ACC_L)
+                 
+                 
+                 .ENDMACRO
+                 // -----------------------------------------------------------------------------------------------------------------
+                 
+                 
+                 //
+                 // ------- debug LED out procedure  --------------------------------------------------------------------------------
+                 // PARAMS:
+                 // @0 - bit number of PORTB the diag LED connected to
+                 // @1 - first byte to flash out
+                 // @2 - second byte to flash out
+                 .MACRO	_DEBUG_OUT
+                 
+                 			cpi		DIAG_COUNT,	64 + 16		// next byte to diag ?
+                 			brne	diag_skip_flags_reload	// no, skip loading flags
+                 
+                 			mov		DIAG_OUT_BYTE,	@2		// latch flags into DIAG_OUT_BYTE
+                 
+                 diag_skip_flags_reload:
+                 			cpi		DIAG_COUNT,	128 + 16	// two diag bytes flashed ?
+                 			brcc	diag_inc_exit			// yes, form up pause by skipping diag flashes
+                 			
+                 			cpi		DIAG_COUNT,	64			// within first diag byte ?
+                 			brcs	diag_out_bits			// yes, go to diag out bits
+                 
+                 			cpi		DIAG_COUNT,	64 + 16		// less than beginning of second diag byte ?
+                 			brcs	diag_inc_exit			// yes, form up pause by skipping diag flashes
+                 
+                 diag_out_bits:
+                 			mov		TEMP_T0, 	DIAG_COUNT
+                 			andi	TEMP_T0, 	0x07		// phases 0..7 of current bit
+                 			breq	diag_out_drive_1		// if phase 0 - LED always ON (either beginning of @@@@____ for "1", or @_______ for "0")
+                 
+                 			sbrc	TEMP_T0,	2			// phases 4..7 ? (bit 2 set?)
+                 				rjmp	diag_out_drive_0	// yes, LED OFF
+                 
+                 			sbrs	DIAG_OUT_BYTE,	7		// current bit == "0" ?
+                 				rjmp	diag_out_drive_0	// yes, go to LED OFF for phases 1..3
+                 
+                 diag_out_drive_1:
+                 			cbi		PORTB,	@0				// drive diag out low (LED ON)
+                 			rjmp	diag_out_next
+                 
+                 diag_out_drive_0:
+                 			sbi		PORTB,	@0				// drive diag out high (LED OFF)
+                 
+                 diag_out_next:
+                 			inc		TEMP_T0					// check if next bit to be processed (TEMP_T0 becomes 0x08 then)
+                 			sbrc	TEMP_T0,	3			// bit 3 set (means that 0x07 just become 0x08) ?
+                 				lsl		DIAG_OUT_BYTE		// yes, shift left DIAG_OUT_BYTE to process next bit
+                 
+                 diag_inc_exit:
+                 			inc		DIAG_COUNT				// next phase
+                 			cpi		DIAG_COUNT,	128 + 16 + 48	// 64 (1st diag byte) + 16 (pause) + 64 (2nd diag byte) + 48 (pause) = 192
+                 			brne	diag_exit
+                 
+                 			clr		DIAG_COUNT				// next diag cycle will start with 0x00
+                 			in		DIAG_OUT_BYTE, @1		// latch current ADC reading into diag byte
+                 					
+                 diag_exit:
+                 
+                 
+                 .ENDMACRO
+                 // -----------------------------------------------------------------------------------------------------------------
+                 
+                 
+                 //
+                 // ------- test mode procedure - 0 to 75% fan speed stepped by 25% for 2 sec each ---------------------------------
+                 .MACRO		_TEST_MODE_FAN
+                 
+                 		mov		BYTE_ACC,	DIAG_COUNT			// get cycle counter (ranged 00000000..10111111)
+                 		lsl		BYTE_ACC						// shift bits 5,4 to make them 7,6
+                 		lsl		BYTE_ACC						//
+                 		andi	BYTE_ACC,	0b11000000			// mask out lower bits
+                 												// PWM changes 0%, 25%, 50%, 75%, 0% ... every 16 * 0.16 seconds
+                 
+                 		sbrc	FLAGS,		FAN_ON_FLAG			// FAN ON request active ?
+                 			in	BYTE_ACC,		OCR1B			// yes, ignore calculated PWM, set OCR1A = OCR1B to reach max duty cycle
+                 		
+                 		out		OCR1A,		BYTE_ACC			// write PWM value to PWM timer
+                 
+                 .ENDMACRO
+                 
+                 ; ------------------------------------
+                 		.cseg
+                 		.org	0
+                 
+                 
+                 ; ============= VECTORS ================================================================
+                 		
+000000 c042      			rjmp	RESET
+000001 c007      			rjmp	INTERRUPT0
+000002 c006      			rjmp	PIN_CHANGE
+000003 c005      			rjmp	T1_COMPARE
+000004 c004      			rjmp	T1_OVERFLOW
+000005 c004      			rjmp	T0_OVERFLOW
+000006 c002      			rjmp	EE_READY
+000007 c001      			rjmp	COMPARATOR
+000008 c000      			rjmp	ADC_COMPLETE
+                 
+                 INTERRUPT0:
+                 PIN_CHANGE:
+                 T1_COMPARE:
+                 T1_OVERFLOW:
+                 EE_READY:
+                 COMPARATOR:
+                 ADC_COMPLETE:
+000009 9518      			reti
+                 
+                 
+                 ; =====================================================================================
+                 ; 
+                 
+                 ; =====================================================================================
+                 ;
+                 ; --------------------------- timer 0 interrupt ---------------------------------------
+                 ; occurs every 160 msec approx (exact period is CLK * 1024 * 256)
+                 ;
+                 ;
+                 ; provides general time synchronization,
+                 ; polls button and ^FAN_ON input,
+                 ; flashes out current ADC reading & FLAGS diagnostic bytes via LED connected to PORTB.3
+                 
+                 T0_OVERFLOW:
+00000a b6af      			in		SREG_COPY,	SREG			; store uP status at the same var as no nested ints allowed
+                 
+                 ; check that main routine executed completely since last timer int (MAIN_SYNC_FLAG should be cleared by the main routine)
+00000b 9468      			set									;
+00000c fc90      			sbrc	FLAGS_EX,	MAIN_SYNC_FLAG	; main routine processed sync cycle ?
+00000d f882      				bld		FLAGS,	WDR_OCCUR_FLAG	; no, set routine error flag
+                 
+                 ; skip 640ms-driven procedures unless it is every 4th int
+00000e 2f98      			mov		TEMP_T0,	DIAG_COUNT		; poll button & ^FAN_ON on every 4th Int0 cycle - i.e. every 640 ms
+00000f 7093      			andi	TEMP_T0,	0x03			; same for ADC flag
+000010 f4a9      			brne	diag_out_start
+                 
+                 ; ------ checking button, fan on request and setting main sync request
+                 			;set								; T was set above !!!
+000011 f890      			bld		FLAGS_EX,	MAIN_SYNC_FLAG	; set main sync flag (every 640 ms)
+                 
+                 ; preparing for checking button
+000012 e092      			ldi		TEMP_T0,	(1 << PORTB1)
+000013 bb97      			out		DDRB,		TEMP_T0		; set PORTB.3 to input (PORTB1 remains to be output)
+                 
+000014 9ac3      			sbi		PORTB,		PORTB3		; set to high to turn on pull-up
+                 
+                 
+                 #if ADC_EVERY_CYCLE
+                 ; do not handle ADC flag
+                 #else
+                 #endif
+                 
+                 ; now checking ^FAN_ON (PORTB.2) input
+                 			;set								; T was set above !!!
+000015 99b2      			sbic	PINB,		PORTB2			; read ^FAN_ON status
+000016 94e8      				clt
+                 ; T now contains current 'fan on' status (as read from PINB.2)
+                 
+                 ; check previous flag status
+000017 fe81      			sbrs	FLAGS,		FAN_ON_FLAG	; last time was ON ?
+000018 c003      				rjmp	t0_fan_last_off		; no, last time was OFF - process it
+                 
+                 ; last time was ON
+000019 f881      			bld		FLAGS,		FAN_ON_FLAG	; save new 'fan on' status
+00001a f41e      			brtc	t0_fan_set_changed		; go to setting 'fan changed' flag if current status is cleared
+00001b c004      			rjmp	t0_check_button			; skip setting 'fan changed' otherwise
+                 
+                 t0_fan_last_off:
+00001c f881      			bld		FLAGS,		FAN_ON_FLAG	; save new 'fan on' status
+00001d f416      			brtc	t0_check_button			; skip setting 'fan changed' flag if current fan status (stored in T) is cleared
+                 
+                 t0_fan_set_changed:
+00001e 9468      			set
+00001f f894      			bld		FLAGS_EX,	FAN_ON_CHANGED_FLAG	
+                 
+                 ; read button status
+                 t0_check_button:
+000020 9468      			set
+000021 99b3      			sbic	PINB,		PORTB3		; read button status
+000022 94e8      				clt
+000023 f893      			bld		FLAGS_EX,	BUTTON_FLAG	; set button pressed flag accordingly
+                 
+                 ; restore PORTB.3 diag out
+000024 e09a      			ldi		TEMP_T0,	(1 << PORTB3) | (1 << PORTB1)	; restore PORTB outputs
+000025 bb97      			out		DDRB,		TEMP_T0							; set PORTB.1,3 to output
+                 		
+                 
+                 ; --------------------------------------------------------
+                 
+                 diag_out_start:
+                 
+                 .LISTMAC
+                +
+                +
+000026 3580     +cpi DIAG_COUNT , 64 + 16
+000027 f409     +brne diag_skip_flags_reload
+                +
+000028 2d78     +mov DIAG_OUT_BYTE , FLAGS
+                +
+                +diag_skip_flags_reload :
+000029 3980     +cpi DIAG_COUNT , 128 + 16
+00002a f488     +brcc diag_inc_exit
+                +
+00002b 3480     +cpi DIAG_COUNT , 64
+00002c f010     +brcs diag_out_bits
+                +
+00002d 3580     +cpi DIAG_COUNT , 64 + 16
+00002e f068     +brcs diag_inc_exit
+                +
+                +diag_out_bits :
+00002f 2f98     +mov TEMP_T0 , DIAG_COUNT
+000030 7097     +andi TEMP_T0 , 0x07
+000031 f021     +breq diag_out_drive_1
+                +
+000032 fd92     +sbrc TEMP_T0 , 2
+000033 c004     +rjmp diag_out_drive_0
+                +
+000034 ff77     +sbrs DIAG_OUT_BYTE , 7
+000035 c002     +rjmp diag_out_drive_0
+                +
+                +diag_out_drive_1 :
+000036 98c3     +cbi PORTB , PORTB3
+000037 c001     +rjmp diag_out_next
+                +
+                +diag_out_drive_0 :
+000038 9ac3     +sbi PORTB , PORTB3
+                +
+                +diag_out_next :
+000039 9593     +inc TEMP_T0
+00003a fd93     +sbrc TEMP_T0 , 3
+00003b 0f77     +lsl DIAG_OUT_BYTE
+                +
+                +diag_inc_exit :
+00003c 9583     +inc DIAG_COUNT
+00003d 3c80     +cpi DIAG_COUNT , 128 + 16 + 48
+00003e f411     +brne diag_exit
+                +
+00003f 2788     +clr DIAG_COUNT
+000040 b175     +in DIAG_OUT_BYTE , ADCH
+                +
+                +diag_exit :
+                +
+                +
+                 			_DEBUG_OUT		PORTB3, 	ADCH,	FLAGS	
+                 
+000041 beaf      			out		SREG, 	SREG_COPY		; restore uP status
+000042 9518      			reti							; return from int
+                 
+                 ; =====================================================================================
+                 
+                 
+                 
+                 ; =====================================================================================
+                 ;
+                 ; ---------------------------------- Reset vector -------------------------------------
+                 
+                 RESET:
+                 
+                 .LISTMAC
+                +
+000043 94f8     +cli
+                +
+000044 e805     +ldi BYTE_ACC , OSCCAL_CAL
+000045 bf01     +out OSCCAL , BYTE_ACC
+                +
+000046 e00a     +ldi BYTE_ACC , ( 1 << PORTB3 ) | ( 1 << PORTB1 )
+000047 bb08     +out PORTB , BYTE_ACC
+                +
+000048 e002     +ldi BYTE_ACC , ( 1 << PORTB1 )
+000049 bb07     +out DDRB , BYTE_ACC
+                +
+                +
+00004a e800     +ldi BYTE_ACC , ( 1 << ACD )
+00004b b908     +out ACSR , BYTE_ACC
+                +
+00004c e804     +ldi BYTE_ACC , ( 1 << ADEN ) | ( 1 << ADPS2 )
+00004d b906     +out ADCSR , BYTE_ACC
+                +
+00004e e603     +ldi BYTE_ACC , ( 1 << REFS0 ) | ( 1 << ADLAR ) | ( 1 << MUX1 ) | ( 1 << MUX0 )
+00004f b907     +out ADMUX , BYTE_ACC
+                +
+000050 e005     +ldi BYTE_ACC , ( 1 << CS02 ) | ( 1 << CS00 )
+000051 bf03     +out TCCR0 , BYTE_ACC
+                +
+000052 e002     +ldi BYTE_ACC , ( 1 << TOIE0 )
+000053 bf09     +out TIMSK , BYTE_ACC
+                +
+000054 ef6f     +ser CUR_ADC
+000055 bd6d     +out OCR1B , CUR_ADC
+                +
+000056 2700     +clr BYTE_ACC
+000057 bd0e     +out OCR1A , BYTE_ACC
+                +
+                +
+                +
+000058 e71a     +ldi MATH_COUNT , ( 1 << PWM1 ) | ( 1 << COM1A1 ) | ( 1 << COM1A0 ) | ( 1 << CS13 ) | ( 1 << CS11 )
+                +
+                +
+                +
+000059 bf10     +out TCCR1 , MATH_COUNT
+                +
+00005a 2488     +clr FLAGS
+00005b 2499     +clr FLAGS_EX
+                +
+                +
+00005c e0e8     +ldi ZL , ADC_BUFFER + ADC_BUFFER_LEN
+                +
+                +init_clr_buf :
+00005d 95ea     +dec ZL
+00005e 8360     +st Z , CUR_ADC
+00005f f7e9     +brne init_clr_buf
+                +
+                +
+000060 b965     +out ADCH , CUR_ADC
+                +
+000061 9468     +set
+                +
+000062 b714     +in MATH_COUNT , MCUSR
+000063 fd13     +sbrc MATH_COUNT , WDRF
+000064 f882     +bld FLAGS , WDR_OCCUR_FLAG
+                +
+000065 2788     +clr DIAG_COUNT
+000066 b175     +in DIAG_OUT_BYTE , ADCH
+000067 27dd     +clr ADC_LOAD_CORRECTION
+                +
+                +
+                +
+000068 99b3     +sbic PINB , PORTB3
+000069 c003     +rjmp init_skip_clr_config
+                +
+                +
+00006a f896     +bld FLAGS_EX , TEST_MODE_FLAG
+                +
+                +
+00006b e026     +ldi WORD_ACC_L , EEPROM_CONFIG_CRC
+00006c d17d     +rcall eeprom_write
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +init_skip_clr_config :
+00006d e00a     +ldi BYTE_ACC , ( 1 << PORTB3 ) | ( 1 << PORTB1 )
+00006e bb07     +out DDRB , BYTE_ACC
+                +
+                +
+00006f 2733     +clr WORD_ACC_H
+000070 e023     +ldi WORD_ACC_L , EEPROM_ADC_CORRECTION
+000071 d16f     +rcall eeprom_read_checksum
+000072 2fd0     +mov ADC_LOAD_CORRECTION , BYTE_ACC
+                +
+000073 d16c     +rcall eeprom_read_preinc_checksum
+000074 2eb0     +mov MIN_ADC , BYTE_ACC
+                +
+000075 d16a     +rcall eeprom_read_preinc_checksum
+000076 2ec0     +mov MAX_ADC , BYTE_ACC
+                +
+000077 d168     +rcall eeprom_read_preinc_checksum
+000078 f411     +brne init_config_incorrect
+                +
+                +
+                +
+000079 9468     +set
+00007a f885     +bld FLAGS , CONFIG_SET_FLAG
+                +
+                +init_config_incorrect :
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +
+                +init_skip_wdr_inc :
+                +
+00007b e107     +ldi BYTE_ACC , POWER_ON_CONTROL_DELAY
+00007c 2ed0     +mov POWER_ON_DELAY , BYTE_ACC
+                +
+00007d 27bb     +clr AUTO_CONFIG_STEP
+00007e 27cc     +clr FAN_CONTROL_TIMING
+00007f 24ee     +clr FAN_CONTROL_REQ_OCR
+000080 24ff     +clr ENGINE_SHUTDOWN_COUNTER
+                +
+000081 e00f     +ldi BYTE_ACC , ( 1 << WDE ) | ( 1 << WDP2 ) | ( 1 << WDP1 ) | ( 1 << WDP0 )
+000082 bd01     +out WDTCR , BYTE_ACC
+                +
+000083 9478     +sei
+                +
+                 		_INITIALIZE			; initialize vars and SFRs
+                 
+                 
+                 ; ====== main loop ===============================================
+                 ; tracks ADC start flag set by timer0 int
+                 ; performs ADC, stores ADC result
+                 ; calculates mean adc reading from last 8 ADC cycles (sliding frame)
+                 ; controls fan according to FAN_ON signal and mean reading for temp sensor
+                 
+                 wait_loop:
+000084 fe90      		sbrs		FLAGS_EX,	MAIN_SYNC_FLAG	; wait for main sync
+000085 cffe      			rjmp	wait_loop
+                 
+                 #if ADC_EVERY_CYCLE
+                 ; call process_temp_sensor on every sync cycle
+                 #else
+                 #endif
+000086 d02b      			rcall	process_temp_sensor				; yes, do temp sensor ADC
+                 
+                 
+000087 fe96      		sbrs		FLAGS_EX,	TEST_MODE_FLAG		; test mode ?
+000088 c008      			rjmp	main_working_mode				; no
+                 
+                 ; -----------------------------------
+                 ; test mode
+                 
+                 .LISTMAC
+                +
+                +
+000089 2f08     +mov BYTE_ACC , DIAG_COUNT
+00008a 0f00     +lsl BYTE_ACC
+00008b 0f00     +lsl BYTE_ACC
+00008c 7c00     +andi BYTE_ACC , 0b11000000
+                +
+                +
+00008d fc81     +sbrc FLAGS , FAN_ON_FLAG
+00008e b50d     +in BYTE_ACC , OCR1B
+                +
+00008f bd0e     +out OCR1A , BYTE_ACC
+                +
+                 		_TEST_MODE_FAN		; handle test mode
+                 
+000090 c014      		rjmp	MAIN_LOOP_END					
+                 
+                 ; ----------------------------------
+                 
+                 main_working_mode:
+000091 d0a6      		rcall		process_fan_pwm					; control fan
+                 
+000092 d0ce      		rcall		process_auto_config				; process autoconfig, if set
+                 
+000093 fe94      		sbrs		FLAGS_EX,	FAN_ON_CHANGED_FLAG	; fan ON signal changed ?
+000094 c00f      			rjmp	main_fan_on_no_change			; no, skip handling changed signal
+                 
+                 ; FAN ON changed, process the change
+000095 94e8      		clt
+000096 f894      		bld		FLAGS_EX,	FAN_ON_CHANGED_FLAG		; clear 'fan changed' flag
+                 
+000097 fc85      		sbrc	FLAGS,		CONFIG_SET_FLAG			; thresholds configured ?
+000098 c00b      			rjmp	main_fan_on_no_change			; yes, just control fan
+                 
+000099 fc84      		sbrc	FLAGS,		CONFIG_ERROR_FLAG		; error occurred during thresholds configuration ?
+00009a c009      			rjmp	main_fan_on_no_change			; yes, just control fan
+                 
+00009b fe81      		sbrs	FLAGS,		FAN_ON_FLAG				; fan ON requested with no configured thresholds and no config error?
+00009c c007      			rjmp	main_fan_on_no_change			; no, skip starting autoconfig procedure
+                 
+00009d 20dd      		tst		POWER_ON_DELAY						; startup time elapsed ?
+00009e f429      		brne	main_fan_on_no_change				; no, skip entering autoconfig mode
+                 
+                 ; fan changed to ON with no conditions above - initiating auto config session
+00009f fe97      		sbrs	FLAGS_EX,	CUR_ADC_IN_RANGE_FLAG	; current ADC in range ?
+0000a0 f018      			brcs	main_fan_on_no_change			; no, skip starting autoconfig procedure
+                 
+                 ; initiating autoconfig
+0000a1 2eb6      		mov		MIN_ADC,	CUR_ADC					; store cur ADC as min ADC
+                 
+0000a2 e0b5      		ldi		AUTO_CONFIG_STEP,	STEP_SAVING_CORRECTION	; start autoconfig procedure
+0000a3 e0a4      		ldi		AUTO_CONFIG_TIMING,	AUTO_CONFIG_CORR_TIME	; set ADC correction time counter
+                 
+                 ; check temperature, set PWM duty accordingly
+                 ; account config_set, shutdown, adc disconnect, adc range and external FAN ON request
+                 main_fan_on_no_change:
+0000a4 d071      		rcall		calc_set_pwm_duty				; calculate PWM
+                 
+                 ; ----- end of main cycle, clear main sync flag
+                 MAIN_LOOP_END:
+0000a5 2700      		clr			BYTE_ACC						; prepare 0 for comparisons
+                 
+0000a6 12d0      		cpse		POWER_ON_DELAY,		BYTE_ACC	; power-on time elapsed ?
+0000a7 94da      			dec			POWER_ON_DELAY				; no, dec POWER_ON_DELAY
+                 
+0000a8 13c0      		cpse		FAN_CONTROL_TIMING,	BYTE_ACC	; fan state time elapsed ?
+0000a9 95ca      			dec			FAN_CONTROL_TIMING			; no, dec FAN_CONTROL_TIMING
+                 
+0000aa fe80      		sbrs		FLAGS,		ENGINE_SHUTTING_DOWN	; engine is shutting down ?
+0000ab c002      			rjmp	main_loop_skip_sd_dec				; no, skip
+                 
+0000ac 12f0      		cpse		ENGINE_SHUTDOWN_COUNTER,	BYTE_ACC	; shutdown time elapsed ?
+0000ad 94fa      			dec			ENGINE_SHUTDOWN_COUNTER				; no, decrement
+                 
+                 main_loop_skip_sd_dec:
+                 
+                 ; ----- watchdog reset -------------
+                 
+0000ae 95a8      		wdr
+                 
+                 ; ----------------------------------
+                 
+0000af 94e8      		clt										;
+0000b0 f890      		bld			FLAGS_EX,	MAIN_SYNC_FLAG	; clear main sync flag
+                 
+0000b1 cfd2      		rjmp		wait_loop						; back to main loop
+                 ; ----------------------------------
+                 
+                 
+                 ;-------------------------------------------------------------------------------
+                 
+                 		.include	"cooler_lib.asm"
+                 
+                 ; 
+                 ; -------- perform ADC conversion and recalc mean ADC result ------------------------------------------------------
+                 process_temp_sensor:
+                 
+                 ; wait for timer1 overflow to make sure OCR1A is actually loaded into internal OCR register
+0000b2 e024      		ldi		WORD_ACC_L,		(1 << TOV1)		;
+0000b3 bf28      		out		TIFR,			WORD_ACC_L		; clear TOV1 in TIFR
+0000b4 0000      		nop										; need any instruction to have TOV1 cleared by hardware. NOP will do here
+                 
+                 adc_wait_ocr_overflow:	
+0000b5 b708      		in		BYTE_ACC,		TIFR			; wait for TOV1 becoming 1
+0000b6 ff02      		sbrs	BYTE_ACC,		TOV1			; which means Timer1 overflow
+0000b7 cffd      			rjmp	adc_wait_ocr_overflow		; and guarantees OCR1A to be loaded into internal OCR
+                 
+                 ; wait until output pulse becomes low to eliminate affecting ADC voltage offset due to current thru common ground
+0000b8 b51e      		in		MATH_COUNT,		OCR1A			; read OCR1A to check if fan is on, off, or pulse-driven
+0000b9 2311      		tst		MATH_COUNT						; fan is off ?
+0000ba f071      		breq	adc_guaranteed_mosfet_off		; yes, do not wait, go to adc start
+                 
+0000bb e031      		ldi		WORD_ACC_H,		1				; wait MOSFET off only once if no OCR reload is necessary
+                 
+0000bc 3c18      		cpi		MATH_COUNT,		OCR_ADC_VALUE	; current OCR1A < threshold for ADC measuring ?
+0000bd f018      		brcs	adc_wait_mosfet_next_cycle		; yes, no need to set lower PWM during ADC conversion - skipping setting lower PWM
+                 
+                 ; need to set lower PWM duty to have enough time for ADC while MOSFET is OFF
+0000be ec08      		ldi		BYTE_ACC,		OCR_ADC_VALUE	;
+0000bf bd0e      		out		OCR1A,			BYTE_ACC		; set lower PWM value during the ADC
+                 		
+0000c0 9533      		inc		WORD_ACC_H						; now we need an extra OCR reload, so waiting MOSFET off twice
+                 												; once with current OCR and next time with new OCR value loaded
+                 adc_wait_mosfet_next_cycle:
+0000c1 e420      		ldi		WORD_ACC_L,		(1 << OCF1A)	;
+0000c2 bf28      		out		TIFR,			WORD_ACC_L		; clear OCF1A in TIFR
+0000c3 0000      		nop										; need any instruction to have OCF1A cleared by hardware. NOP will do here
+                 
+                 ; wait until fan MOSFET turns off
+                 adc_wait_mosfet_off:	
+0000c4 b708      		in		BYTE_ACC,		TIFR			;
+0000c5 ff06      		sbrs	BYTE_ACC,		OCF1A			;
+0000c6 cffd      			rjmp	adc_wait_mosfet_off			; wait until MOSFET is driven low
+                 
+                 ; we have not less than approx 16 * (256 - OCR_ADC_VALUE) uSeconds while MOSFET is off
+                 ; +0
+                 
+0000c7 953a      		dec		WORD_ACC_H						; if need to wait only once - this decrement will end the loop
+0000c8 f7c1      		brne	adc_wait_mosfet_next_cycle		; otherwise, we'll perform another waiting cycle
+                 
+                 adc_guaranteed_mosfet_off:
+                 ; now we need to wait while current oscillations upon MOSFET turning-off disappear 
+                 ; meanwhile taking the result of previous ADC cycle and calc mean value
+                 
+                 ; ------- get previous ADC cycle result
+0000c9 b105      		in 		BYTE_ACC,	ADCH					; get result of previous ADC
+                 
+0000ca 9468      		set											; set ADC disconnected flag
+0000cb 3100      		cpi		BYTE_ACC,	DISCONNECTED_MAX_ADC	; temp sensor connected ?
+0000cc f020      		brcs	adc_disconnected_flag_set			; no, go to setting ADC_DISCONNECTED_FLAG
+                 
+                 ; sensor connected
+0000cd e04d      		ldi		MATH_WORD_L,	ENGINE_SHUTDOWN_TIME		; set shutdown time
+0000ce 2ef4      		mov		ENGINE_SHUTDOWN_COUNTER,	MATH_WORD_L		; to be used when entering shutdown mode
+                 
+0000cf 94e8      		clt											; clear T as ADC is connected
+0000d0 f880      		bld		FLAGS,		ENGINE_SHUTTING_DOWN	; clear "engine off" flag and clear ADC_DISCONNECTED_FLAG then
+                 
+                 adc_disconnected_flag_set:
+0000d1 f886      		bld		FLAGS,		ADC_DISCONNECTED_FLAG	; set temp sensor disconnected flag accordingly
+                 
+                 ; ------- correct read ADC result using ADC_LOAD_CORRECTION
+0000d2 fe85      		sbrs	FLAGS,		CONFIG_SET_FLAG			; config set ?
+0000d3 c00a      			rjmp		adc_skip_correction			; no, skip correction
+                 
+                 ; ADC_LOAD_CORRECTION is for full RPM (256)
+                 ; so, to get correction for current RPM we need to calculate correction = ADC_LOAD_CORRECTION * OCR1A / 256
+                 ; i.e. take high byte of ADC_LOAD_CORRECTION * OCR1A
+0000d4 2f4d      		mov		MATH_WORD_L,	ADC_LOAD_CORRECTION
+0000d5 2f01      		mov		BYTE_ACC,		MATH_COUNT			; MATH_COUNT = OCR1A (current PWM)
+0000d6 d0fb      		rcall	mul16_8u							; WORD_ACC_H:WORD_ACC_L = ADC_LOAD_CORRECTION * OCR1A
+                 
+0000d7 b105      		in 		BYTE_ACC,	ADCH					; get result of previous ADC again
+0000d8 0f03      		add		BYTE_ACC,	WORD_ACC_H				; and correct the result, taking high byte as low (thus dividing by 256)
+                 
+0000d9 9468      		set											;
+0000da 2333      		tst		WORD_ACC_H							; set ADC_CORRECTED_FLAG if correcting value > 0
+0000db f409      		brne	adc_corr_flag_set					;
+0000dc 94e8      		clt											;
+                 
+                 adc_corr_flag_set:
+0000dd f887      		bld		FLAGS,		ADC_CORRECTED_FLAG		;
+                 
+                 ; ------ handle ADC_DISCONNECT_FLAG, ENGINE_SHUTTING_DOWN flags
+                 adc_skip_correction:
+0000de fe86      		sbrs	FLAGS,		ADC_DISCONNECTED_FLAG	; temp sensor disconnected ?
+0000df c007      			rjmp	adc_sensor_connected			; no, skip shutdown logic
+                 
+                 ; process disconnected ADC
+0000e0 fe95      		sbrs	FLAGS_EX,	FAN_PULSE_OCCUR_FLAG	; fan pulses ever occurred ?
+0000e1 c02e      			rjmp	adc_skip_store_and_recalc		; no, skip shutdown and recalculating mean ADC logic
+                 
+0000e2 fe92      		sbrs	FLAGS_EX,	ADC_EVER_CONNECTED_FLAG	; temp sensor ever connected ?
+0000e3 c02c      			rjmp	adc_skip_store_and_recalc		; no, sensor never been connected, skip shutdown and recalculating mean ADC logic
+                 
+0000e4 9468      		set
+0000e5 f880      		bld		FLAGS,		ENGINE_SHUTTING_DOWN	; set "engine off" flag
+                 
+0000e6 c029      		rjmp	adc_skip_store_and_recalc			; skip mean recalculation
+                 
+                 ; ADC reading in range (sensor connected), store ADC result
+                 adc_sensor_connected:
+                 
+                 ; correct sudden negative surges by limiting ADC reading dynamics
+0000e7 20dd      		tst		POWER_ON_DELAY							; power-on time elapsed ?
+0000e8 f449      		brne	adc_store_reading						; no, skip correcting dynamics
+                 
+0000e9 fe85      		sbrs	FLAGS,			CONFIG_SET_FLAG			; thresholds configured ?
+0000ea c007      			rjmp	adc_store_reading					; no, skip dynamic correction	
+                 
+0000eb 2f46      		mov		MATH_WORD_L,	CUR_ADC					;
+0000ec 1b40      		sub		MATH_WORD_L,	BYTE_ACC				; new ADC > mean ADC ?
+0000ed f020      		brcs	adc_store_reading						; yes, do not limit positive dynamics
+                 		
+                 ; dynamics negative - limit it
+0000ee 3042      		cpi		MATH_WORD_L,	ADC_MAX_NEG_DYNAMICS	; exceeds max negative dynamics ?
+0000ef f010      		brcs	adc_store_reading						; no, store uncorrected
+                 
+0000f0 2f06      		mov		BYTE_ACC,		CUR_ADC					;
+0000f1 5002      		subi	BYTE_ACC,		ADC_MAX_NEG_DYNAMICS	; yes, limit ADC drop to ADC_MAX_NEG_DYNAMICS readings in every ADC cycle
+                 
+                 adc_store_reading:
+0000f2 95e3      		inc		ZL								; pre-inc ptr
+0000f3 70e7      		andi	ZL,		(ADC_BUFFER_LEN - 1)	; make it roll (0..7)		
+0000f4 8300      		st		Z,		BYTE_ACC				; store in ADC buffer @ current ptr
+                 
+                 ; ------ recalculate mean ADC from 8 previous ADC results
+0000f5 2722      		clr		WORD_ACC_L				;
+0000f6 2733      		clr		WORD_ACC_H				; clear accumulated sum
+                 
+0000f7 2ffe      		mov		ZH,			ZL			; store Z in r31
+                 
+0000f8 e0e7      		ldi		ZL,			ADC_BUFFER + ADC_BUFFER_LEN - 1
+                 ; +14
+                 
+                 adc_recalc_mean:
+0000f9 8100      		ld		BYTE_ACC,	Z
+0000fa 0f20      		add		WORD_ACC_L,	BYTE_ACC	; low result += [z]
+0000fb 2700      		clr		BYTE_ACC
+0000fc 1f30      		adc		WORD_ACC_H, BYTE_ACC
+0000fd 95ea      		dec		ZL						; ptr--
+0000fe f7d2      		brpl	adc_recalc_mean			; while <> 0 - next reading
+                 ; +48 + 16 = +64
+                 
+0000ff 2fef      		mov		ZL,			ZH			; restore Z
+                 
+                 ; WORD_ACC_H:WORD_ACC_L contains average ADC reading * ADC_BUFFER_LEN
+                 ; shift right 3 times (div by 8) to find mean reading
+000100 9537      		ror		WORD_ACC_H
+000101 9527      		ror		WORD_ACC_L
+                 
+000102 9537      		ror		WORD_ACC_H
+000103 9527      		ror		WORD_ACC_L
+                 
+000104 9537      		ror		WORD_ACC_H
+000105 9527      		ror		WORD_ACC_L
+                 
+                 ; WORD_ACC_L now contains average ADC reading
+000106 2f62      		mov		CUR_ADC,	WORD_ACC_L	; save calculated mean in CUR_ADC
+                 
+                 ; set CUR_ADC IN RANGE flag according to new CUR_ADC value
+000107 94e8      		clt		
+000108 3168      		cpi		CUR_ADC,	AUTO_CONFIG_MIN_ADC		; CUR_ADC < lower threshold ?
+000109 f028      		brcs	adc_set_in_range					; yes, go to clearing flag
+                 
+00010a ef08      		ldi		BYTE_ACC,	AUTO_CONFIG_MAX_ADC
+00010b 1706      		cp		BYTE_ACC,	CUR_ADC					; CUR_ADC > AUTO_CONFIG_MAX_ADC ?
+00010c f010      		brcs	adc_set_in_range					; yes, go to clearing flag
+                 
+00010d 9468      		set											; CUR_ADC in range, set T to copy to the flag
+00010e f892      		bld		FLAGS_EX,	ADC_EVER_CONNECTED_FLAG	; and set temp sensor ever connected
+                 
+                 adc_set_in_range:
+00010f f897      		bld		FLAGS_EX,	CUR_ADC_IN_RANGE_FLAG	; set CUR_ADC_IN_RANGE_FLAG
+                 
+                 adc_skip_store_and_recalc:
+                 ; ----------------------------
+                 ; start ADC conversion
+                 ; conversion time = 20usec * 15 cycles = 300usec
+                 ; no need to disable ints - t0 overflow never happens as main routine is synchronized with t0 overflow 
+                 
+                 ; ADC conversion start		
+000110 ec04      		ldi		BYTE_ACC,	(1 << ADEN) | (1 << ADSC) | (1 << ADPS2)	; ADEN | ADSC | ADPS2 enable ADC, clock/16
+000111 b906      		out		ADCSR,		BYTE_ACC		; start ADC
+                 ; +66 (40 us)
+                 
+                 adc_wait_completion:
+000112 9936      		sbic	ADCSR, 		ADSC			; go to save ADC result when ADC finished
+000113 cffe      			rjmp	adc_wait_completion		; wait until ADC completes
+                 	
+                 ; -----------------------------
+                 
+000114 bd1e      		out		OCR1A,		MATH_COUNT	; restore OCR1A if was changed for ADC purpose
+                 
+                 #if ADC_EVERY_CYCLE
+                 ; do not use ADC flag
+                 #else
+                 #endif
+000115 9508      		ret
+                 
+                 ; -----------------------------------------------------------------------------------------------------------------
+                 
+                 
+                 ;
+                 ; 
+                 ; ------ calculate OCR1A value (duty cycle) for current temp (ADC reading) ----------------------------------------
+                 calc_set_pwm_duty:
+                 ; in: CUR_ADC - ADC reading
+                 ; out: BYTE_ACC - OCR1A value
+                 
+000116 b50d      		in		BYTE_ACC,		OCR1B
+000117 fc81      		sbrc	FLAGS,		FAN_ON_FLAG			; fan ON requested ?
+000118 c01d      			rjmp	calc_pwm_set				; yes, exit with fan @ full RPM
+                 		
+000119 2700      		clr		BYTE_ACC							; prepare value for fan OFF
+                 
+00011a fe80      		sbrs	FLAGS,			ENGINE_SHUTTING_DOWN	; engine shutdown ?
+00011b c004      			rjmp	calc_pwm_no_shut					; no, skip s/d logic
+                 
+                 ; processing engine shutdown
+00011c 20ff      		tst		ENGINE_SHUTDOWN_COUNTER					; s/d counter zero ?
+00011d f0c1      		breq	calc_pwm_set							; yes, exit with fan stopped
+                 
+00011e e800      		ldi		BYTE_ACC,	OCR_ENGINE_OFF_VALUE		; no, set shutdown PWM
+00011f c016      		rjmp	calc_pwm_set							; and exit
+                 
+                 calc_pwm_no_shut:
+000120 fc86      		sbrc	FLAGS,			ADC_DISCONNECTED_FLAG	; temp sensor connected ?
+000121 c014      			rjmp	calc_pwm_set					; no, turn OFF fan
+                 
+000122 23bb      		tst		AUTO_CONFIG_STEP					; in autoconfig (and no FAN ON request - checked above)?
+000123 f499      		brne	calc_pwm_skip_set					; yes, exit without changing PWM at all
+                 
+000124 fe85      		sbrs	FLAGS,			CONFIG_SET_FLAG		; thresholds configured ?
+000125 c010      			rjmp	calc_pwm_set					; no, turn OFF fan
+                 
+000126 20dd      		tst			POWER_ON_DELAY					; power-on time elapsed ?
+000127 f471      		brne 		calc_pwm_set					; no, turn OFF fan
+                 
+000128 16c6      		cp		MAX_ADC,		CUR_ADC				; greater than MAX_ADC ?
+000129 f060      		brcs	calc_pwm_set						; yes, turn fan off
+                 
+00012a ef0f      		ldi		BYTE_ACC,		OCR_MAX_VALUE		; prepare value for fan ON
+00012b 156b      		cp		CUR_ADC,		MIN_ADC				; less than MIN_ADC ?
+00012c f048      		brcs	calc_pwm_set						; yes, set max PWM duty
+                 
+                 ; calculate PWM duty cycle as
+                 ; OCR_MIN_VALUE + (Umax - U) * (OCR_MAX_VALUE - OCR_MIN_VALUE) / (Umax - Umin) 
+00012d 2d0c      		mov		BYTE_ACC,		MAX_ADC							;
+00012e 1b06      		sub		BYTE_ACC,		CUR_ADC							; BYTE_ACC = (Umax - U)
+                 
+00012f ee40      		ldi		MATH_WORD_L,	OCR_MAX_VALUE - OCR_MIN_VALUE	; MATH_WORD_L = (OCR_MAX_VALUE - OCR_MIN_VALUE)
+                 
+                 											; BYTE_ACC = (Umax - U), 
+000130 d0a1      		rcall	mul16_8u					; MATH_WORD_L = (OCR_MAX_VALUE - OCR_MIN_VALUE)
+                 											; result: WORD_ACC_H:WORD_ACC_L = (Umax - U) * (OCR_MAX_VALUE - OCR_MIN_VALUE)
+                 
+000131 2d0c      		mov		BYTE_ACC,		MAX_ADC
+000132 190b      		sub		BYTE_ACC,		MIN_ADC		; BYTE_ACC = (Umax - Umin)	
+                 
+                 											; BYTE_ACC = (Umax - Umin)	
+000133 d08a      		rcall	div16_8u					; WORD_ACC_H:WORD_ACC_L = (Umax - U) * (OCR_MAX_VALUE - OCR_MIN_VALUE)
+                 											; result: WORD_ACC_H:WORD_ACC_L = (Umax - U) * (OCR_MAX_VALUE - OCR_MIN_VALUE) / (Umax - Umin)
+                 	
+000134 e10f      		ldi		BYTE_ACC,		OCR_MIN_VALUE	; adding OCR_MIN_VALUE to the result
+000135 0f02      		add		BYTE_ACC,		WORD_ACC_L		; BYTE_ACC = OCR_MIN_VALUE + (Umax - U) * (OCR_MAX_VALUE - OCR_MIN_VALUE) / (Umax - Umin)
+                 
+                 calc_pwm_set:
+000136 2ee0      		mov		FAN_CONTROL_REQ_OCR,	BYTE_ACC	; store needed PWM in pending location (to be used by fan_process)
+                 
+                 calc_pwm_skip_set:
+000137 9508      		ret										; return with BYTE_ACC = PWM duty value
+                 
+                 ; -----------------------------------------------------------------------------------------------------------------
+                 
+                 
+                 ; ------ soft-start for cooler fan procedure --------------------------------------------------------
+                 ; performs a soft-start for cooler fan
+                 ; does not allow changing ON/OFF state within less than MIN_FAN_STATE_TIME 640msec counts
+                 ; except when in unconfigurated state or due to explicit FAN ON request
+                 process_fan_pwm:
+000138 2d0e      		mov		BYTE_ACC,		FAN_CONTROL_REQ_OCR		;
+000139 b52e      		in		WORD_ACC_L,		OCR1A					;
+00013a 1720      		cp		WORD_ACC_L,		BYTE_ACC				; actual PWM == desired ?
+00013b f121      		breq	fan_proc_exit							; yes, exit
+                 
+00013c fe85      		sbrs	FLAGS,		CONFIG_SET_FLAG			; config set ?
+00013d c01d      			rjmp		fan_proc_set_pwm			; no, skip state time & smoothing logic	- set PWM immediately
+                 
+00013e fc80      		sbrc	FLAGS,		ENGINE_SHUTTING_DOWN	; shutdown ?
+00013f c01b      			rjmp		fan_proc_set_pwm			; yes, skip state time & smoothing logic - set PWM immediately
+                 
+000140 2300      		tst		BYTE_ACC							; fan ON requested ?
+000141 f431      		brne	fan_proc_request_on					; yes, process FAN ON
+                 
+                 ; requested PWM == 0
+000142 2322      		tst		WORD_ACC_L							; requested OFF, check if current state is OFF
+000143 f059      		breq	fan_proc_no_change					; current is OFF - no change in fan state, go to fan control
+                 
+000144 23cc      		tst		FAN_CONTROL_TIMING					; current is ON - check if time elapsed to change fan state
+000145 f041      		breq	fan_proc_change_reload				; elapsed, proceed with stopping fan
+                 
+                 ; current is ON while OFF requested within less than MIN_FAN_STATE_TIME
+000146 e10f      		ldi		BYTE_ACC, 	OCR_MIN_VALUE			; keep fan at min power until MIN_FAN_STATE_TIME elapsed
+000147 c007      		rjmp	fan_proc_no_change
+                 
+                 ; requested PWM > 0
+                 fan_proc_request_on:
+000148 fc81      		sbrc	FLAGS,		FAN_ON_FLAG				; FAN ON request active and requested > 0 ?
+000149 c011      			rjmp	fan_proc_set_pwm				; yes, skip state time & smoothing logic - set PWM immediately
+                 
+00014a 2322      		tst		WORD_ACC_L							; requested ON, check current
+00014b f419      		brne	fan_proc_no_change					; current ON, no change in fan state, go to fan control
+                 
+00014c 23cc      		tst		FAN_CONTROL_TIMING					; fan state changed - check if time elapsed to change fan state
+00014d f491      		brne	fan_proc_exit						; not yet elapsed, do not change PWM, exiting
+                 
+                 fan_proc_change_reload:
+00014e e1c7      		ldi		FAN_CONTROL_TIMING,		MIN_FAN_STATE_TIME	; yes, reload state time counter and proceed with state change
+                 
+                 fan_proc_no_change:
+00014f 1702      		cp		BYTE_ACC,		WORD_ACC_L			; check if new duty cycle > current
+000150 f050      		brcs	fan_proc_set_pwm					; no, new duty < current, so skip smoothing PWM duty cycle
+                 		
+                 ; PWM smoothing logic
+                 ; new duty > current
+000151 2322      		tst		WORD_ACC_L							; fan was off ?
+000152 f411      		brne	fan_proc_limit_positive				; no, go to smoothing value
+                 
+000153 e40c      		ldi		BYTE_ACC, 		OCR_START_VALUE		; fan was OFF, so to rev up fan, load constant fan start value
+000154 c006      		rjmp 	fan_proc_set_pwm					; start with OCR_START_VALUE
+                 
+                 ; limit fan dynamics MAX_FAN_DYN_DUTY
+                 fan_proc_limit_positive:
+000155 2f30      		mov		WORD_ACC_H,		BYTE_ACC
+000156 1b32      		sub		WORD_ACC_H,		WORD_ACC_L			; WORD_ACC_H = requested PWM - last PWM
+000157 3032      		cpi		WORD_ACC_H,		MAX_FAN_DYN_DUTY	; difference exceeds max positive dynamics ?
+000158 f010      		brcs	fan_proc_set_pwm					; no, set as requested
+                 
+000159 2f02      		mov		BYTE_ACC,		WORD_ACC_L			; yes, limit positive dynamics
+00015a 5f0e      		subi	BYTE_ACC,	-MAX_FAN_DYN_DUTY		; to MAX_FAN_DYN_DUTY
+                 
+                 fan_proc_set_pwm:
+00015b bd0e      		out		OCR1A,			BYTE_ACC			; set new PWM in OCR
+                 
+00015c 2300      		tst		BYTE_ACC							; we just loaded turn off fan OCR value?
+00015d f011      		breq	fan_proc_exit						; yes, skip setting pulse occur flag
+                 
+00015e 9468      		set												; fan was ON at least once,
+00015f f895      		bld		FLAGS_EX,		FAN_PULSE_OCCUR_FLAG	; set FAN_PULSE_OCCUR_FLAG accordingly
+                 
+                 fan_proc_exit:		
+000160 9508      		ret
+                 
+                 ; -------------------------------------------------------------------------
+                 
+                 
+                 ;
+                 ; -----	autoconfig steps dispatcher --------------------------
+                 ;
+                 process_auto_config:
+000161 23bb      		tst			AUTO_CONFIG_STEP
+000162 f101      		breq		ac_continue
+                 
+000163 2f1b      		mov			MATH_COUNT,	AUTO_CONFIG_STEP
+000164 951a      		dec			MATH_COUNT
+000165 f1f9      		breq		ac_step_SAVING_CONFIG
+000166 951a      		dec			MATH_COUNT
+000167 f139      		breq		ac_step_WAITING_GAP
+000168 951a      		dec			MATH_COUNT
+000169 f0d1      		breq		ac_step_SLOWING_FAN
+00016a 951a      		dec			MATH_COUNT
+00016b f091      		breq		ac_step_WAITING_FAN_OFF
+00016c 951a      		dec			MATH_COUNT
+00016d f021      		breq		ac_step_SAVING_CORRECTION
+                 
+                 ac_error:
+00016e 9468      		set
+00016f f884      		bld			FLAGS,		CONFIG_ERROR_FLAG		; set error flag
+000170 27bb      		clr			AUTO_CONFIG_STEP					; clear step code
+000171 c046      		rjmp		ac_exit								; exit
+                 				
+                 ; ----------------------------
+                 ; save ADC correction value due to common ground and voltage drop
+                 ac_step_SAVING_CORRECTION:
+000172 fe81      		sbrs	FLAGS,		FAN_ON_FLAG	; fan on ?
+000173 cffa      			rjmp	ac_error			; no, error as it should be on during at least 4 * 0.64 seconds
+                 
+000174 95aa      		dec		AUTO_CONFIG_TIMING
+000175 f469      		brne	ac_continue
+                 
+000176 27dd      		clr		ADC_LOAD_CORRECTION			; set correction = 0
+000177 2d0b      		mov		BYTE_ACC,	MIN_ADC
+000178 8120      		ld		WORD_ACC_L,	Z				; get last stored ADC value directly from buffer
+000179 1b02      		sub		BYTE_ACC,	WORD_ACC_L		; MIN ADC < last stored ADC?
+00017a f010      		brcs	ac_step_corr_skip			; yes, leave correction = 0
+                 
+00017b 9503      		inc		BYTE_ACC					; add 1 to have rounding rather than truncation when calculating proportional correction
+                 
+00017c 2fd0      		mov		ADC_LOAD_CORRECTION,	BYTE_ACC	; save correction
+                 
+                 ac_step_corr_skip:
+00017d c004      		rjmp	ac_next_step		
+                 
+                 
+                 ; ----------------------------
+                 ; wait until fan request is OFF, then go to next step
+                 ac_step_WAITING_FAN_OFF:
+00017e fc81      		sbrc	FLAGS,		FAN_ON_FLAG	
+00017f c003      			rjmp	ac_continue
+                 
+000180 ec00      		ldi		BYTE_ACC,	AUTO_CONFIG_OCR_VALUE_1	; set high fan rpm
+000181 2ee0      		mov		FAN_CONTROL_REQ_OCR,	BYTE_ACC
+                 
+                 ac_next_step:
+000182 95ba      		dec		AUTO_CONFIG_STEP					; next step & exit
+                 ac_continue:
+000183 c034      		rjmp	ac_exit							; exit
+                 
+                 ; ----------------------------
+                 ; slowing down fan, go to next step when OFF
+                 ; check if button is pressed during slowdown, then store current ADC as max and go to save autoconfig
+                 ac_step_SLOWING_FAN:
+000184 fc81      		sbrc	FLAGS,		FAN_ON_FLAG			; fan on ?
+000185 cfe8      			rjmp	ac_error					; yes, go to error as it should be off during slowing FAN
+                 
+000186 fc93      		sbrc	FLAGS_EX,	BUTTON_FLAG			; button pressed ?
+000187 c018      			rjmp	ac_step_BUTTON_DETECTED		; yes, skip further steps, go to processing button
+                 
+000188 94ea      		dec		FAN_CONTROL_REQ_OCR
+000189 2d0e      		mov		BYTE_ACC,			FAN_CONTROL_REQ_OCR
+00018a 310f      		cpi		BYTE_ACC,			AUTO_CONFIG_OCR_VALUE_2
+00018b f7b8      		brcc	ac_continue
+                 
+00018c 24ee      		clr		FAN_CONTROL_REQ_OCR
+                 
+00018d e5ae      		ldi		AUTO_CONFIG_TIMING,		AUTO_CONFIG_GAP_TIME	; set gap time counter, go to next step
+                 
+00018e cff3      		rjmp	ac_next_step
+                 
+                 ; ----------------------------
+                 ; wait AUTO_CONFIG_TIMING * 640 msec with fan OFF, then store current ADC as max and go to next step
+                 ; check if button is pressed during waiting, then store current ADC as max and go to save autoconfig
+                 ac_step_WAITING_GAP:
+00018f fc81      		sbrc	FLAGS,		FAN_ON_FLAG			; fan on ?
+000190 cfdd      			rjmp	ac_error					; yes, go to error as it should be off during slowing FAN
+                 
+000191 fc93      		sbrc	FLAGS_EX,		BUTTON_FLAG			; button pressed ?
+000192 c00d      			rjmp	ac_step_BUTTON_DETECTED			; yes, skip further steps, go to processing button
+                 		
+000193 95aa      		dec		AUTO_CONFIG_TIMING
+000194 f771      		brne	ac_continue
+                 
+000195 fe97      		sbrs	FLAGS_EX,	CUR_ADC_IN_RANGE_FLAG	; current ADC in range ?
+000196 cfd7      			rjmp	ac_error						; no, set autoconfig error
+                 
+000197 2ec6      		mov		MAX_ADC,	CUR_ADC				; store cur ADC as max ADC
+                 
+                 ; sub 1/8 of MAX-MIN from MAX to shift up fan turn on threshold
+                 ; when set automatically
+000198 2f06      		mov		BYTE_ACC,	CUR_ADC				; BYTE_ACC = max - min
+000199 190b      		sub		BYTE_ACC,	MIN_ADC				;
+00019a f298      		brcs	ac_error						; no, set autoconfig error
+                 
+00019b 9506      		lsr		BYTE_ACC
+00019c 9506      		lsr		BYTE_ACC
+00019d 9506      		lsr		BYTE_ACC						; BYTE_ACC = (max - min) / 8
+                 
+00019e 1ac0      		sub		MAX_ADC,	BYTE_ACC			; MAX_ADC = MAX_ADC - (max - min) / 8
+00019f cfe2      		rjmp	ac_next_step
+                 
+                 ac_step_BUTTON_DETECTED:
+0001a0 fe97      		sbrs	FLAGS_EX,	CUR_ADC_IN_RANGE_FLAG	; current ADC in range ?
+0001a1 cfcc      			rjmp	ac_error						; no, set autoconfig error
+                 
+0001a2 2ec6      		mov		MAX_ADC,		CUR_ADC					; store cur ADC as max ADC
+0001a3 e0b1      		ldi		AUTO_CONFIG_STEP,	STEP_SAVING_CONFIG	; set next step as STEP_SAVING_CONFIG
+0001a4 cfde      		rjmp	ac_continue								; go to exiting
+                 
+                 ; ----------------------------
+                 ; save min/max thresholds with checksum, set up 'Configured' flag and exit autoconfig mode
+                 ac_step_SAVING_CONFIG:
+                 ; check that MAX_ADC > MIN_ADC
+0001a5 2d0c      		mov		BYTE_ACC,	MAX_ADC				; BYTE_ACC = max - min
+0001a6 190b      		sub		BYTE_ACC,	MIN_ADC				; MAX > MIN ?
+0001a7 f230      		brcs	ac_error						; no, set autoconfig error
+                 
+0001a8 3004      		cpi		BYTE_ACC,	CONFIG_MIN_MAX_GAP	; MAX - MIN >= CONFIG_MIN_MAX_GAP ?
+0001a9 f220      		brcs	ac_error						; no, set autoconfig error	
+                 
+                 .LISTMAC
+                +
+                +
+0001aa e023     +ldi WORD_ACC_L , EEPROM_ADC_CORRECTION
+0001ab 2f0d     +mov BYTE_ACC , ADC_LOAD_CORRECTION
+0001ac 2f30     +mov WORD_ACC_H , BYTE_ACC
+0001ad d03c     +rcall eeprom_write
+                +
+0001ae 2d0b     +mov BYTE_ACC , MIN_ADC
+0001af d038     +rcall eeprom_write_preinc_checksum
+                +
+0001b0 2d0c     +mov BYTE_ACC , MAX_ADC
+0001b1 d036     +rcall eeprom_write_preinc_checksum
+                +
+0001b2 9531     +neg WORD_ACC_H
+                +
+0001b3 2f03     +mov BYTE_ACC , WORD_ACC_H
+0001b4 d034     +rcall eeprom_write_preinc
+                +
+                +
+                 		_SAVE_CONFIG							; save configuration to EEPROM
+                 		
+0001b5 9468      		set										;
+0001b6 f885      		bld		FLAGS,		CONFIG_SET_FLAG		; set CONFIG_SET_FLAG in current variable
+                 
+0001b7 cfca      		rjmp	ac_next_step
+                 
+                 ac_exit:
+0001b8 9468      		set
+0001b9 23bb      		tst			AUTO_CONFIG_STEP
+0001ba f409      		brne		ac_exit_set_flag
+0001bb 94e8      		clt
+                 
+                 ac_exit_set_flag:
+0001bc f883      		bld			FLAGS,		AUTO_CONFIG_FLAG
+0001bd 9508      		ret
+                 
+                 ; -------------------------------------------------------------------------
+                 
+                 
+                 		.include	"math.asm"
+                 
+                 ; divide word/byte
+                 ; in: WORD_ACC_H:WORD_ACC_L - dividend; BYTE_ACC - divisor
+                 ; out: WORD_ACC_H:WORD_ACC_L - word result; MATH_WORD_H:MATH_WORD_L - remainder
+                 ; used: WORD_ACC_H, WORD_ACC_L, MATH_WORD_L, MATH_WORD_H, MATH_COUNT, 
+                  
+                 
+                 div16_8u: 
+0001be 2744      		clr 	MATH_WORD_L 				; clear remainder Low byte 
+0001bf 1b55      		sub 	MATH_WORD_H,	MATH_WORD_H ; clear remainder High byte and carry 
+                 		
+0001c0 e111      		ldi 	MATH_COUNT,		17 			; init loop counter 
+                 d16_8u_1: 
+0001c1 1f22      		rol		WORD_ACC_L 					; shift left dividend 
+0001c2 1f33      		rol		WORD_ACC_H 
+                 
+0001c3 951a      		dec		MATH_COUNT					; decrement counter: 
+0001c4 f409      		brne	d16_8u_2 					; if done 
+0001c5 9508      		ret 								; return 
+                 
+                 d16_8u_2:
+0001c6 1f44      		rol		MATH_WORD_L  				;shift dividend into remainder 
+0001c7 1f55      		rol		MATH_WORD_H 
+0001c8 1b40      		sub		MATH_WORD_L,	BYTE_ACC	; remainder = remainder - divisor 
+0001c9 4050      		sbci	MATH_WORD_H,	0	 		; 
+                 
+0001ca f428      		brcc 	d16_8u_3 					;if result negative - restore remainder 
+                 
+0001cb 0f40      		add		MATH_WORD_L,	BYTE_ACC
+0001cc f408      		brcc	d16_8_u_21 
+0001cd 9553      		inc		MATH_WORD_H
+                 
+                 d16_8_u_21: 
+0001ce 9488      		clc 						; clear carry to be shifted into result 
+0001cf cff1      		rjmp	d16_8u_1 			; else 
+                 
+                 d16_8u_3: 
+0001d0 9408      		sec 						; set carry to be shifted into result 
+0001d1 cfef      		rjmp	d16_8u_1 
+                 
+                 ; -------------------------------------------------------------------------
+                 
+                 
+                 ; -------------------------------------------------------------------------
+                 ; multiply 8 * 8
+                 ; in: BYTE_ACC - multiplicand , MATH_WORD_L - multiplier
+                 ; out: WORD_ACC_H:WORD_ACC_L - word result
+                 ; used: WORD_ACC_H, MATH_WORD_L, MATH_WORD_H
+                 
+                 mul16_8u:
+0001d2 2755      		clr		MATH_WORD_H					; clear interim storage
+0001d3 2722      		clr		WORD_ACC_L					; clear result registers
+0001d4 2733      		clr		WORD_ACC_H					;
+                 
+                 m16_8u_1:
+0001d5 9488      		clc
+0001d6 9507      		ror		BYTE_ACC
+0001d7 f410      		brcc	m16_8u_2
+                 
+0001d8 0f24      		add 	WORD_ACC_L,		MATH_WORD_L ; add LSB of rm1 to the result
+0001d9 1f35      		adc 	WORD_ACC_H,		MATH_WORD_H
+                 
+                 m16_8u_2:
+0001da 9488      		clc 								; clear carry bit
+0001db 1f44      		rol 	MATH_WORD_L 				; rotate LSB left (multiply by 2)
+0001dc 1f55      		rol 	MATH_WORD_H 				; rotate carry 
+                 
+0001dd 2300      		tst 	BYTE_ACC 					; all bits zero?
+0001de f7b1      		brne 	m16_8u_1
+                 
+0001df 9508      		ret
+                 
+                 		.include	"eeprom.asm"
+                 
+                 ; in: ++WORD_ACC_L - EEPROM address, WORD_ACC_H - accumulating checksum 
+                 ; out: BYTE_ACC - EEPROM data read, WORD_ACC_H - accumulating checksum
+                 ; Z flag is set when checksum read == 0
+                 eeprom_read_preinc_checksum:
+0001e0 9523      		inc		WORD_ACC_L	
+                 ; -------------------------------------------------------------------------
+                 ; in: WORD_ACC_L - EEPROM address, WORD_ACC_H - accumulating checksum
+                 ; out: BYTE_ACC - EEPROM data read, WORD_ACC_H - accumulating checksum
+                 eeprom_read_checksum:
+0001e1 99e1      		sbic	EECR,		EEWE		; wait until EEWE becomes 0
+0001e2 cffe      			rjmp	eeprom_read_checksum
+0001e3 bb2e      		out		EEAR,		WORD_ACC_L
+0001e4 9ae0      		sbi		EECR,		EERE		; set EERE
+0001e5 b30d      		in		BYTE_ACC,	EEDR
+0001e6 0f30      		add		WORD_ACC_H,	BYTE_ACC
+0001e7 9508      		ret
+                 
+                 
+                 ; -------------------------------------------------------------------------
+                 ; in: ++WORD_ACC_L - EEPROM address, BYTE_ACC - data to write, WORD_ACC_H - accumulating checksum
+                 ; out: none
+                 eeprom_write_preinc_checksum:
+0001e8 0f30      		add		WORD_ACC_H,	BYTE_ACC
+                 ; -------------------------------------------------------------------------
+                 ; in: ++WORD_ACC_L - EEPROM address, BYTE_ACC - data to write
+                 ; out: none
+                 eeprom_write_preinc:
+0001e9 9523      		inc		WORD_ACC_L	
+                 ; -------------------------------------------------------------------------
+                 ; in: WORD_ACC_L - EEPROM address, BYTE_ACC - data to write
+                 ; out: none
+                 eeprom_write:
+0001ea 99e1      		sbic	EECR,		EEWE		; wait until EEWE becomes 0
+0001eb cffe      			rjmp	eeprom_write
+0001ec bb2e      		out		EEAR,		WORD_ACC_L
+0001ed bb0d      		out		EEDR,		BYTE_ACC	
+                 		
+0001ee 94f8      		cli
+0001ef 9ae2      			sbi		EECR,		EEMWE		; EEMWE
+0001f0 9ae1      			sbi		EECR,		EEWE		; EEWE
+0001f1 9478      		sei
+                 
+0001f2 9508      		ret
+                 
+                 
+                 ; ------ EEPROM vars ------------------------------------------------------
+                 		.eseg
+                 		.org		0
+                 
+000000 00 00     EEPROM_RUN_COUNT:		.dw		0
+000002 00        EEPROM_WDR_COUNT:		.db		0
+000003 00        EEPROM_ADC_CORRECTION:	.db		0
+000004 00        EEPROM_U_MIN:			.db		0
+000005 00        EEPROM_U_MAX:			.db		0
+000006 00        EEPROM_CONFIG_CRC:		.db		0
+                 
+                 
+                 
+                 ; -------------------------------------------------------------------------
+                 
+                 
+                 
+                 
+                 ;-------------------------------------------------------------------------------
+                 
+                 
+
+
+RESOURCE USE INFORMATION
+------------------------
+
+Notice:
+The register and instruction counts are symbol table hit counts,
+and hence implicitly used resources are not counted, eg, the
+'lpm' instruction without operands implicitly uses r0 and z,
+none of which are counted.
+
+x,y,z are separate entities in the symbol table and are
+counted separately from r26..r31 here.
+
+.dseg memory usage only counts static data declared with .byte
+
+ATtiny15 register use summary:
+r0 :   0 r1 :   0 r2 :   0 r3 :   0 r4 :   0 r5 :   0 r6 :   0 r7 :   0 
+r8 :  34 r9 :  21 r10:   2 r11:   8 r12:   9 r13:   6 r14:   7 r15:   5 
+r16: 112 r17:  17 r18:  31 r19:  22 r20:  13 r21:   8 r22:  16 r23:   5 
+r24:  11 r25:  11 r26:   4 r27:   9 r28:   6 r29:   6 r30:   8 r31:   2 
+x  :   0 y  :   0 z  :   4 
+Registers used: 25 out of 35 (71.4%)
+
+ATtiny15 instruction use summary:
+adc   :   2 add   :   7 and   :   0 andi  :   4 asr   :   0 bclr  :   0 
+bld   :  21 brbc  :   0 brbs  :   0 brcc  :   5 brcs  :  17 breq  :  13 
+brge  :   0 brhc  :   0 brhs  :   0 brid  :   0 brie  :   0 brlo  :   0 
+brlt  :   0 brmi  :   0 brne  :  20 brpl  :   1 brsh  :   0 brtc  :   2 
+brts  :   0 brvc  :   0 brvs  :   0 bset  :   0 bst   :   0 cbi   :   1 
+cbr   :   0 clc   :   3 clh   :   0 cli   :   2 cln   :   0 clr   :  23 
+cls   :   0 clt   :   8 clv   :   0 clz   :   0 com   :   0 cp    :   5 
+cpc   :   0 cpi   :  12 cpse  :   3 dec   :  16 eor   :   0 in    :  13 
+inc   :   8 ld    :   2 ldi   :  39 lpm   :   0 lsl   :   3 lsr   :   3 
+mov   :  37 neg   :   1 nop   :   2 or    :   0 ori   :   0 out   :  27 
+rcall :  16 ret   :   8 reti  :   2 rjmp  :  62 rol   :   6 ror   :   7 
+sbc   :   0 sbci  :   1 sbi   :   5 sbic  :   6 sbis  :   0 sbr   :   0 
+sbrc  :  16 sbrs  :  21 sec   :   1 seh   :   0 sei   :   2 sen   :   0 
+ser   :   1 ses   :   0 set   :  13 sev   :   0 sez   :   0 sleep :   0 
+st    :   2 sub   :  10 subi  :   2 swap  :   0 tst   :  17 wdr   :   1 
+
+Instructions used: 49 out of 90 (54.4%)
+
+ATtiny15 memory use summary [bytes]:
+Segment   Begin    End      Code   Data   Used    Size   Use%
+---------------------------------------------------------------
+[.cseg] 0x000000 0x0003e6    998      0    998    1024  97.5%
+[.dseg] 0x000000 0x000060      0      0      0       0      -
+[.eseg] 0x000000 0x000007      0      7      7      64  10.9%
+
+Assembly complete, 0 errors, 4 warnings
