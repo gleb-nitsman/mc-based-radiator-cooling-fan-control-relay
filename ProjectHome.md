@@ -1,0 +1,1 @@
+Implemented in the form factor of a standard automotive relay. Can be installed instead of a radiator fan relay in car radiator fan control circuit. requires only one extra connection (to 1-lead temp sensor). Automatically determines low and high temp thresholds and controls fan rpm between the low/high temp points.
